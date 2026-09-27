@@ -166,18 +166,31 @@ export function readConversationSteps(
   }
 }
 
-export function deriveToolTitle(name: string, rawInputJson: string): string {
+function extractRawInputRecord(rawInput: unknown): Record<string, unknown> | null {
   try {
-    const parsed: unknown = JSON.parse(rawInputJson);
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      typeof (parsed as { CommandLine?: unknown }).CommandLine === "string"
-    ) {
-      return (parsed as { CommandLine: string }).CommandLine;
-    }
+    const parsed: unknown = typeof rawInput === "string" ? JSON.parse(rawInput) : rawInput;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
   } catch {
-    // ignore
+    return null;
+  }
+}
+
+export function deriveToolTitle(name: string, rawInput: unknown): string {
+  const p = extractRawInputRecord(rawInput);
+  if (p) {
+    for (const key of [
+      "toolSummary",
+      "toolAction",
+      "CommandLine",
+      "AbsolutePath",
+      "TargetFile",
+    ] as const) {
+      const val = p[key];
+      if (typeof val === "string" && val.trim().length > 0) return val.trim();
+    }
+    if (typeof p.Query === "string" && p.Query.trim().length > 0) return `grep "${p.Query.trim()}"`;
+    if (typeof p.pattern === "string" && p.pattern.trim().length > 0)
+      return `find "${p.pattern.trim()}"`;
   }
   return name || "tool call";
 }

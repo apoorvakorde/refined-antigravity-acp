@@ -200,4 +200,54 @@ describe("dangling-tool-calls fix", () => {
     };
     expect(s2Update?.toolCallId).toBe("call_2");
   });
+
+  it("enriches tool_call and tool_call_update with human-readable derived titles when upstream omits title", () => {
+    const fix = createToolCallCleanupFix();
+    const sessionId = "s1";
+
+    const callMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+          toolCallId: "call_1607565",
+          name: "run_command",
+          rawInput: {
+            CommandLine: "kubectl --context ctrl-eaws-lh1 -n signoz get pods",
+            toolSummary: "Check SigNoz pods status",
+          },
+        },
+      },
+    };
+
+    const out1 = fix.onInbound!(callMsg, dummyContext) as AcpStreamMessage[];
+    expect(out1).toHaveLength(1);
+    const update1 = (out1[0] as unknown as { params?: SessionUpdateParams }).params?.update as {
+      title?: string;
+    };
+    expect(update1?.title).toBe("Check SigNoz pods status");
+
+    // Later tool_call_update without title should receive the tracked title
+    const updateMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: SESSION_UPDATES.TOOL_CALL_UPDATE,
+          toolCallId: "call_1607565",
+          status: "completed",
+        },
+      },
+    };
+
+    const out2 = fix.onInbound!(updateMsg, dummyContext) as AcpStreamMessage[];
+    expect(out2).toHaveLength(1);
+    const update2 = (out2[0] as unknown as { params?: SessionUpdateParams }).params?.update as {
+      title?: string;
+    };
+    expect(update2?.title).toBe("Check SigNoz pods status");
+  });
 });

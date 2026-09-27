@@ -299,7 +299,7 @@ describe("premature-turn-stop reproduction and verification", () => {
     expect(promptText).toContain("10 tool calls");
   });
 
-  it("solution: intercepts premature stop when model ends turn without tool calls and without assistant text", async () => {
+  it("solution: does not trigger continuation when turn has no tool calls", async () => {
     const fix = createPrematureTurnStopFix();
     const context = createMockContext();
     const writtenToChild: AcpStreamMessage[] = [];
@@ -317,19 +317,90 @@ describe("premature-turn-stop reproduction and verification", () => {
       context,
     );
 
-    // No tool calls, only whitespace
-    await fix.onInbound?.(makeMessageChunk(sessionId, "   \n\t  "), context);
+    // No tool calls, turn finishes
+    const normalResult = makePromptResult(505, "end_turn");
+    const result = await fix.onInbound?.(normalResult, context);
 
-    const emptyResult = makePromptResult(505, "end_turn");
-    const intercepted = await fix.onInbound?.(emptyResult, context);
+    expect(result).toEqual([normalResult]);
+    expect(writtenToChild).toHaveLength(0);
+  });
 
-    expect(intercepted).toEqual([]);
-    expect(writtenToChild).toHaveLength(1);
+  it("solution: does not trigger continuation when user explicitly asked to stop even after tool calls", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
 
-    const promptText = (
-      writtenToChild[0] as unknown as { params: { prompt: Array<{ text: string }> } }
-    ).params.prompt[0]?.text;
-    expect(promptText).toContain("[Automated Continuation]");
-    expect(promptText).toContain("You stopped without providing a response");
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 606,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Stop and give me a status report" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // Tools ran
+    await fix.onInbound?.(makeToolCall(sessionId, "call_stop_1", "Tool 1"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_stop_1", "completed"), context);
+
+    // Turn completes
+    const stopResult = makePromptResult(606, "end_turn");
+    const result = await fix.onInbound?.(stopResult, context);
+
+    expect(result).toEqual([stopResult]);
+    expect(writtenToChild).toHaveLength(0);
+  });
+
+  it("solution: correctly detects assistant text when emitted as an array of content blocks", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 707,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId, prompt: [{ type: "text", text: "Check status" }] },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // Tools ran
+    await fix.onInbound?.(makeToolCall(sessionId, "call_707", "Status check"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_707", "completed"), context);
+
+    // Upstream emits content as an array of blocks (common in ACP)
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+            content: [{ type: "text", text: "# Status Report\nAll healthy." }],
+          },
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    const normalResult = makePromptResult(707, "end_turn");
+    const result = await fix.onInbound?.(normalResult, context);
+
+    // Properly detected text, no continuation dispatched
+    expect(result).toEqual([normalResult]);
+    expect(writtenToChild).toHaveLength(0);
   });
 });

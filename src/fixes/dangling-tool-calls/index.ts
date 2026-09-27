@@ -21,6 +21,7 @@ import {
   type SessionUpdatePayload,
 } from "../../core/types.js";
 import { extractSessionId } from "../../core/session-cache.js";
+import { deriveToolTitle } from "../dropped-history-chunks/index.js";
 
 function isBackgroundedOutput(output: unknown): boolean {
   if (typeof output === "string") {
@@ -53,6 +54,15 @@ function createToolCompletionMessage(sessionId: string, toolCallId: string): Acp
 
 export class ToolCallTracker {
   private readonly activeToolCalls = new Map<string, Set<string>>();
+  private readonly toolTitles = new Map<string, string>();
+
+  setTitle(toolCallId: string, title: string): void {
+    this.toolTitles.set(toolCallId, title);
+  }
+
+  getTitle(toolCallId: string): string | undefined {
+    return this.toolTitles.get(toolCallId);
+  }
 
   recordToolCall(sessionId: string, toolCallId: string): void {
     let set = this.activeToolCalls.get(sessionId);
@@ -109,6 +119,7 @@ export class ToolCallTracker {
 
   dispose(): void {
     this.activeToolCalls.clear();
+    this.toolTitles.clear();
   }
 }
 
@@ -119,6 +130,13 @@ function handleToolCall(
 ): AcpStreamMessage[] {
   const toolCallId = update.toolCallId;
   const flushMessages = tracker.flushDangling(sessionId, toolCallId);
+
+  if (!update.title && update.name) {
+    update.title = deriveToolTitle(update.name, update.rawInput);
+  }
+  if (toolCallId && update.title) {
+    tracker.setTitle(toolCallId, update.title);
+  }
 
   if (toolCallId) {
     if (update.status === "completed" || update.status === "failed") {
@@ -140,6 +158,15 @@ function handleToolCallUpdate(
 ): void {
   const toolCallId = update.toolCallId;
   if (!toolCallId) return;
+
+  if (!update.title) {
+    const knownTitle = tracker.getTitle(toolCallId);
+    if (knownTitle) {
+      update.title = knownTitle;
+    } else if (update.name) {
+      update.title = deriveToolTitle(update.name, update.rawInput);
+    }
+  }
 
   if (update.status === "completed" || update.status === "failed") {
     tracker.resolveToolCall(sessionId, toolCallId);
