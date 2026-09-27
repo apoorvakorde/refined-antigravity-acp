@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { encodeLengthDelimited } from "../../test-utils/index.js";
-import { decodeStep, isInternalProxyPrompt, STEP_TYPE_USER, STEP_TYPE_AGENT } from "./index.js";
+import type { AcpStreamMessage, InboundContext, OutboundContext } from "../../core/types.js";
+import {
+  decodeStep,
+  droppedHistoryChunksFix,
+  isInternalProxyPrompt,
+  STEP_TYPE_USER,
+  STEP_TYPE_AGENT,
+} from "./index.js";
 
 describe("dropped-history-chunks unit tests", () => {
   describe("isInternalProxyPrompt", () => {
@@ -87,6 +94,32 @@ describe("dropped-history-chunks unit tests", () => {
         callId: "call_123",
         name: "run_command",
       });
+    });
+  });
+
+  describe("onOutbound", () => {
+    it("ignores internal recycle session/load requests", () => {
+      const dummyOutContext = {} as unknown as OutboundContext;
+      const recycleMsg: AcpStreamMessage = {
+        jsonrpc: "2.0",
+        id: "__refined_agy_recycle_load",
+        method: "session/load",
+        params: { sessionId: "s-recycle" },
+      } as unknown as AcpStreamMessage;
+
+      const fix = droppedHistoryChunksFix;
+      fix.onOutbound?.(recycleMsg, dummyOutContext);
+
+      // Verify that an internal recycle load does not intercept subsequent responses
+      const recycleResponse: AcpStreamMessage = {
+        jsonrpc: "2.0",
+        id: "__refined_agy_recycle_load",
+        result: {},
+      } as unknown as AcpStreamMessage;
+
+      const dummyInContext = {} as unknown as InboundContext;
+      const inbound = fix.onInbound?.(recycleResponse, dummyInContext);
+      expect(inbound).toEqual([recycleResponse]);
     });
   });
 });

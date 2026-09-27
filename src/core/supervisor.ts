@@ -3,6 +3,11 @@ import readline from "node:readline";
 import {
   ACP_METHODS,
   STOP_REASONS,
+  RECYCLE_ID_PREFIX,
+  RECYCLE_INIT_ID,
+  RECYCLE_LOAD_ID,
+  RECYCLE_MODE_ID,
+  RECYCLE_CONFIG_PREFIX,
   type AcpStreamMessage,
   type CachedSessionMetadata,
   type CoreContext,
@@ -27,13 +32,15 @@ import {
 
 import { defaultSpawnProcess, traceAcp, writeJsonMessage } from "./transport.js";
 
-export const RECYCLE_ID_PREFIX = "__refined_agy_recycle_";
-export const RECYCLE_INIT_ID = `${RECYCLE_ID_PREFIX}init`;
-export const RECYCLE_LOAD_ID = `${RECYCLE_ID_PREFIX}load`;
-export const RECYCLE_MODE_ID = `${RECYCLE_ID_PREFIX}mode`;
-export const RECYCLE_CONFIG_PREFIX = `${RECYCLE_ID_PREFIX}config_`;
+export {
+  RECYCLE_ID_PREFIX,
+  RECYCLE_INIT_ID,
+  RECYCLE_LOAD_ID,
+  RECYCLE_MODE_ID,
+  RECYCLE_CONFIG_PREFIX,
+};
 
-const DEFAULT_RECYCLE_TIMEOUT_MS = 10_000;
+const DEFAULT_RECYCLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
 const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
 
@@ -41,6 +48,15 @@ function parseEnvMs(val: string | undefined, defaultMs: number): number {
   if (!val) return defaultMs;
   const num = Number(val);
   return Number.isFinite(num) && num > 0 ? num : defaultMs;
+}
+
+function extractModeId(modeId?: string, meta?: unknown): string | undefined {
+  if (modeId !== undefined) return modeId;
+  if (meta && typeof meta === "object" && "modeId" in meta) {
+    const val = (meta as { modeId?: unknown }).modeId;
+    return typeof val === "string" ? val : undefined;
+  }
+  return undefined;
 }
 
 function delay(ms: number): Promise<void> {
@@ -260,28 +276,43 @@ export class ProcessSupervisor implements CoreContext {
 
   private recordOutboundSessionNew(msg: AcpStreamMessage): void {
     if (!("id" in msg) || msg.id === null || msg.id === undefined) return;
-    const p = (msg as { params?: { cwd?: string; modeId?: string; _meta?: unknown } }).params;
+    const p = (
+      msg as {
+        params?: {
+          cwd?: string;
+          modeId?: string;
+          _meta?: unknown;
+          mcpServers?: unknown[];
+        };
+      }
+    ).params;
     if (!p) return;
     const pending = this.sessionCache.pendingSessionMetadata.get(msg.id) ?? {};
     if (p.cwd !== undefined) pending.cwd = p.cwd;
     if (p._meta !== undefined) pending._meta = p._meta;
     if (p.modeId !== undefined) pending.lastModeId = p.modeId;
+    if (p.mcpServers !== undefined) pending.mcpServers = p.mcpServers;
     recordPendingSessionMetadata(this.sessionCache, msg.id, pending);
   }
 
   private recordOutboundSessionLoad(msg: AcpStreamMessage): void {
     const p = (
-      msg as { params?: { sessionId?: string; cwd?: string; modeId?: string; _meta?: unknown } }
+      msg as {
+        params?: {
+          sessionId?: string;
+          cwd?: string;
+          modeId?: string;
+          _meta?: unknown;
+          mcpServers?: unknown[];
+        };
+      }
     ).params;
     if (!p?.sessionId) return;
     const session = getOrCreateSession(this.sessionCache, p.sessionId);
     if (p.cwd !== undefined) session.cwd = p.cwd;
     if (p._meta !== undefined) session._meta = p._meta;
-    const mode =
-      p.modeId ??
-      (p._meta && typeof p._meta === "object" && "modeId" in p._meta
-        ? (p._meta as { modeId?: string }).modeId
-        : undefined);
+    if (p.mcpServers !== undefined) session.mcpServers = p.mcpServers;
+    const mode = extractModeId(p.modeId, p._meta);
     if (mode !== undefined) session.lastModeId = mode;
   }
 
@@ -489,7 +520,10 @@ export class ProcessSupervisor implements CoreContext {
     session: CachedSessionMetadata,
     context: OutboundContext,
   ): Promise<void> {
-    const loadParams: Record<string, unknown> = { sessionId: session.sessionId };
+    const loadParams: Record<string, unknown> = {
+      sessionId: session.sessionId,
+      mcpServers: session.mcpServers ?? [],
+    };
     if (session.cwd !== undefined) loadParams.cwd = session.cwd;
     if (session._meta !== undefined) loadParams._meta = session._meta;
 

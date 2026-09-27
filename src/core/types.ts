@@ -45,6 +45,12 @@ export const STOP_REASONS = {
   CANCELLED: "cancelled",
 } as const;
 
+export const RECYCLE_ID_PREFIX = "__refined_agy_recycle_";
+export const RECYCLE_INIT_ID = `${RECYCLE_ID_PREFIX}init`;
+export const RECYCLE_LOAD_ID = `${RECYCLE_ID_PREFIX}load`;
+export const RECYCLE_MODE_ID = `${RECYCLE_ID_PREFIX}mode`;
+export const RECYCLE_CONFIG_PREFIX = `${RECYCLE_ID_PREFIX}config_`;
+
 /**
  * Standard JSON-RPC 2.0 message variants in ACP
  */
@@ -133,6 +139,7 @@ export interface CachedSessionMetadata {
   _meta?: unknown;
   lastModeId?: string;
   lastConfigOptions: Map<string, CachedConfigOption>;
+  mcpServers?: unknown[];
   needsRecycle?: boolean;
   /** Fixes can store arbitrary session-scoped state here */
   fixData?: Map<string, unknown>;

@@ -480,14 +480,13 @@ function handleSessionLoadMcp(
   params: { mcpServers?: unknown[]; sessionId?: unknown },
   context: OutboundContext,
 ): boolean {
-  if (typeof params.sessionId !== "string" || params.mcpServers) return false;
+  if (typeof params.sessionId !== "string") return false;
+  if (Array.isArray(params.mcpServers)) return false;
   const session = getOrCreateSession(context.sessionCache, params.sessionId);
-  const cachedServers = getSessionMcpServers(session);
-  if (cachedServers) {
-    params.mcpServers = structuredClone(cachedServers);
-    return true;
-  }
-  return false;
+  const cachedServers =
+    getSessionMcpServers(session) ?? (session.mcpServers as unknown[] | undefined);
+  params.mcpServers = cachedServers ? structuredClone(cachedServers) : [];
+  return true;
 }
 
 function recordOutboundMcpServersOriginal(

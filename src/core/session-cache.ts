@@ -56,6 +56,7 @@ function applyPendingSessionMetadata(
   if (pending.cwd !== undefined) session.cwd = pending.cwd;
   if (pending._meta !== undefined) session._meta = pending._meta;
   if (pending.lastModeId !== undefined) session.lastModeId = pending.lastModeId;
+  if (pending.mcpServers !== undefined) session.mcpServers = pending.mcpServers;
   if (pending.fixData) {
     session.fixData ??= new Map();
     for (const [key, value] of pending.fixData.entries()) {

@@ -13,6 +13,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   ACP_METHODS,
   SESSION_UPDATES,
+  RECYCLE_ID_PREFIX,
   isJsonRpcRequest,
   isMethod,
   type AcpStreamMessage,
@@ -281,7 +282,11 @@ export const droppedHistoryChunksFix: DroppedHistoryChunksFix = {
   readConversationSteps,
 
   onOutbound(msg: AcpStreamMessage, _context: OutboundContext): AcpStreamMessage {
-    if (isJsonRpcRequest(msg) && msg.method === ACP_METHODS.SESSION_LOAD) {
+    if (
+      isJsonRpcRequest(msg) &&
+      msg.method === ACP_METHODS.SESSION_LOAD &&
+      !String(msg.id).startsWith(RECYCLE_ID_PREFIX)
+    ) {
       const sessionId = extractSessionId(msg);
       if (sessionId) {
         pendingReplayLoads.set(msg.id, sessionId);
