@@ -66,7 +66,7 @@ function getNestedRecord(obj: Record<string, unknown>, key: string): Record<stri
 
 function tryRestartPaseoDaemon(): void {
   try {
-    childProcess.execFileSync("paseo", ["daemon", "restart"], { stdio: "ignore" });
+    childProcess.execFileSync("paseo", ["daemon", "restart"], { stdio: "ignore", timeout: 3000 });
     console.log("✓ Restarted Paseo daemon");
   } catch {
     // Paseo daemon may not be active or paseo CLI not in PATH
