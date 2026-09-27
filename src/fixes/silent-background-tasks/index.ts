@@ -372,27 +372,86 @@ export function inferToolName(
   return inferFromTitle(title ?? undefined) ?? inferFromRawInput(rawInput);
 }
 
-function extractSchedulePrompt(rawArgs: unknown): string {
-  if (rawArgs && typeof rawArgs === "object") {
-    const p = (rawArgs as { Prompt?: unknown }).Prompt;
-    if (typeof p === "string" && p.trim()) return p.trim();
+function extractParsedArgs(rawArgs: unknown): Record<string, unknown> | null {
+  if (!rawArgs) return null;
+  if (typeof rawArgs === "string") {
+    try {
+      const parsed: unknown = JSON.parse(rawArgs);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+  return typeof rawArgs === "object" ? (rawArgs as Record<string, unknown>) : null;
+}
+
+function truncateText(text: string, maxLen = 60): string {
+  const trimmed = text.trim();
+  return trimmed.length > maxLen ? `${trimmed.slice(0, maxLen - 3)}...` : trimmed;
+}
+
+function extractScheduleDesc(args: Record<string, unknown>): string | undefined {
+  const fields = [args.toolSummary, args.toolAction, args.Prompt, args.prompt];
+  for (const field of fields) {
+    if (typeof field === "string") {
+      const trimmed = field.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return undefined;
+}
+
+function extractScheduleDuration(args: Record<string, unknown>): string | undefined {
+  const dur = args.DurationSeconds;
+  if (typeof dur === "number" || typeof dur === "string") {
+    return `${dur}s`;
+  }
+  return undefined;
+}
+
+function extractScheduleCron(args: Record<string, unknown>): string | undefined {
+  const cron = args.CronExpression;
+  if (typeof cron === "string") {
+    const trimmed = cron.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+export function formatScheduleTask(rawArgs: unknown): string {
+  const args = extractParsedArgs(rawArgs);
+  if (!args) return "Timer";
+
+  const desc = extractScheduleDesc(args);
+  const duration = extractScheduleDuration(args);
+  const cron = extractScheduleCron(args);
+
+  if (cron) {
+    return desc ? `Recurring: ${truncateText(desc)} (${cron})` : `Recurring: ${cron}`;
+  }
+  if (desc && duration) {
+    return `Timer (${duration}): ${truncateText(desc)}`;
+  }
+  if (desc) {
+    return `Timer: ${truncateText(desc)}`;
+  }
+  if (duration) {
+    return `Timer: Wait ${duration}`;
   }
   return "Timer";
 }
 
 function extractCommandLine(rawArgs: unknown): string | null {
-  if (!rawArgs) return null;
-  let obj: unknown = rawArgs;
-  if (typeof rawArgs === "string") {
-    try {
-      obj = JSON.parse(rawArgs);
-    } catch {
-      return null;
-    }
+  const obj = extractParsedArgs(rawArgs);
+  if (!obj) return null;
+  if (typeof obj.toolSummary === "string" && obj.toolSummary.trim()) {
+    return truncateText(obj.toolSummary);
   }
-  if (obj && typeof obj === "object" && "CommandLine" in obj) {
-    const cmd = (obj as { CommandLine?: unknown }).CommandLine;
-    if (typeof cmd === "string" && cmd.trim()) return cmd.trim();
+  if (typeof obj.toolAction === "string" && obj.toolAction.trim()) {
+    return truncateText(obj.toolAction);
+  }
+  if (typeof obj.CommandLine === "string" && obj.CommandLine.trim()) {
+    return truncateText(obj.CommandLine);
   }
   return null;
 }
@@ -432,14 +491,9 @@ function handleInboundToolCall(
     return entries.length > prevCount ? entries : null;
   }
   if (toolName === TOOL_SCHEDULE) {
-    const prompt = extractSchedulePrompt(toolArgs);
+    const taskName = formatScheduleTask(toolArgs);
     const prevCount = tracker.getEntries(sessionId).length;
-    const entries = tracker.recordCustomTask(
-      sessionId,
-      `Scheduled task: ${prompt}`,
-      "medium",
-      toolCallId,
-    );
+    const entries = tracker.recordCustomTask(sessionId, taskName, "medium", toolCallId);
     tracker.setWaiting(sessionId, true);
     return entries.length > prevCount ? entries : null;
   }

@@ -7,6 +7,7 @@ import type {
 } from "../../core/types.js";
 import {
   createBackgroundTasksFix,
+  formatScheduleTask,
   formatSubagentContent,
   inferToolName,
   parseSubagentsFromArgs,
@@ -527,5 +528,81 @@ describe("backgroundTasksFix processInbound", () => {
     // Must be deferred!
     expect(res).toEqual([]);
     expect(fix.tracker.isWaitingForTasks(sessionId)).toBe(true);
+  });
+
+  it("synthesizes descriptive plan entries for schedule tool calls", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "s-schedule";
+
+    const toolMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_sched_1",
+          name: "schedule",
+          rawInput: {
+            DurationSeconds: 15,
+            Prompt: "Verify pod is ready",
+            toolSummary: "Wait for ClickHouse",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = await fix.onInbound?.(toolMsg, dummyInboundContext);
+    expect(res).toHaveLength(2);
+    expect(res?.[1]).toMatchObject({
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Timer (15s): Wait for ClickHouse",
+              priority: "medium",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    });
+  });
+});
+
+describe("formatScheduleTask", () => {
+  it("formats human-readable descriptions with duration and summary", () => {
+    expect(
+      formatScheduleTask({
+        DurationSeconds: 30,
+        Prompt: "Check pod status",
+        toolSummary: "Wait for ClickHouse pod restart",
+      }),
+    ).toBe("Timer (30s): Wait for ClickHouse pod restart");
+
+    expect(
+      formatScheduleTask({
+        DurationSeconds: 10,
+        Prompt: "Remind user",
+      }),
+    ).toBe("Timer (10s): Remind user");
+
+    expect(
+      formatScheduleTask(
+        JSON.stringify({
+          DurationSeconds: 60,
+        }),
+      ),
+    ).toBe("Timer: Wait 60s");
+
+    expect(
+      formatScheduleTask({
+        CronExpression: "0 * * * *",
+        Prompt: "Hourly health check",
+      }),
+    ).toBe("Recurring: Hourly health check (0 * * * *)");
   });
 });
