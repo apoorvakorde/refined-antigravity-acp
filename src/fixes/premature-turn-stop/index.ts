@@ -92,7 +92,6 @@ export class PrematureTurnStopTracker {
       state.activePromptId === promptId || state.continuationPromptId === promptId;
     return (
       isMatchingPrompt &&
-      state.toolCallCount > 0 &&
       state.assistantTextLength === 0 &&
       state.continuationCount < maxContinuations
     );
@@ -157,9 +156,15 @@ export class PrematureTurnStopTracker {
 }
 
 export function buildContinuationText(toolCallCount: number): string {
+  if (toolCallCount > 0) {
+    return (
+      `[Automated Continuation]: You executed ${toolCallCount} tool calls but stopped without providing a status report or proceeding with the task. ` +
+      `Please summarize what you have accomplished, evaluate the current state, and continue executing the next steps to complete the task.`
+    );
+  }
   return (
-    `[Automated Continuation]: You executed ${toolCallCount} tool calls but stopped without providing a status report or proceeding with the task. ` +
-    `Please summarize what you have accomplished, evaluate the current state, and continue executing the next steps to complete the task.`
+    `[Automated Continuation]: You stopped without providing a response or proceeding with the task. ` +
+    `Please provide a complete answer or proceed with the requested task.`
   );
 }
 
@@ -215,8 +220,8 @@ function handleInboundUpdate(
     tracker.recordToolCall(sessionId);
   } else if (update.sessionUpdate === SESSION_UPDATES.AGENT_MESSAGE_CHUNK) {
     const text = (update as { content?: { text?: unknown } })?.content?.text;
-    if (typeof text === "string" && text.length > 0) {
-      tracker.recordAssistantText(sessionId, text.length);
+    if (typeof text === "string" && text.trim().length > 0) {
+      tracker.recordAssistantText(sessionId, text.trim().length);
     }
   }
 }
@@ -249,16 +254,14 @@ async function handlePromptResult(
   const res = msg.result as Record<string, unknown> | null;
   const stopReason = res?.stopReason;
 
-  if (stopReason === STOP_REASONS.CANCELLED) {
+  if (stopReason === STOP_REASONS.CANCELLED || stopReason === "cancelled") {
     tracker.clearSession(sessionId);
     return null;
   }
 
   const maxContinuations = options.maxContinuations ?? 2;
-  if (
-    stopReason === STOP_REASONS.END_TURN &&
-    tracker.isPrematureStop(sessionId, promptId, maxContinuations)
-  ) {
+  const isEndTurn = stopReason === STOP_REASONS.END_TURN || stopReason === "endTurn";
+  if (isEndTurn && tracker.isPrematureStop(sessionId, promptId, maxContinuations)) {
     const dispatched = await dispatchContinuationPrompt(sessionId, tracker, context);
     if (dispatched) return [];
   }
@@ -288,7 +291,11 @@ export function createPrematureTurnStopFix(options: PrematureTurnStopOptions = {
       if (isMethod(msg, ACP_METHODS.SESSION_PROMPT)) {
         const promptId = (msg as { id?: string | number }).id;
         tracker.startTurn(sessionId, promptId);
-      } else if (isMethod(msg, ACP_METHODS.SESSION_CANCEL)) {
+      } else if (
+        isMethod(msg, ACP_METHODS.SESSION_CANCEL) ||
+        isMethod(msg, ACP_METHODS.SESSION_CLOSE) ||
+        isMethod(msg, ACP_METHODS.SESSION_DELETE)
+      ) {
         tracker.clearSession(sessionId);
       }
 

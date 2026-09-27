@@ -257,4 +257,79 @@ describe("premature-turn-stop reproduction and verification", () => {
     expect(result).toEqual([cancelResult]);
     expect(writtenToChild).toHaveLength(0);
   });
+
+  it("solution: intercepts premature stop when model only emits whitespace chunks after tools", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 404,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId, prompt: [{ type: "text", text: "Why do we need this?" }] },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // 10 tool calls executed
+    for (let i = 0; i < 10; i++) {
+      await fix.onInbound?.(makeToolCall(sessionId, `call_${i}`, `Tool ${i}`), context);
+      await fix.onInbound?.(makeToolCallUpdate(sessionId, `call_${i}`, "completed"), context);
+    }
+
+    // Model only emits whitespace chunk ("\n")
+    await fix.onInbound?.(makeMessageChunk(sessionId, "\n"), context);
+
+    // Upstream attempts to finish turn
+    const emptyResult = makePromptResult(404, "endTurn");
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+
+    expect(intercepted).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+
+    const promptText = (
+      writtenToChild[0] as unknown as { params: { prompt: Array<{ text: string }> } }
+    ).params.prompt[0]?.text;
+    expect(promptText).toContain("[Automated Continuation]");
+    expect(promptText).toContain("10 tool calls");
+  });
+
+  it("solution: intercepts premature stop when model ends turn without tool calls and without assistant text", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 505,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId, prompt: [{ type: "text", text: "Pure question" }] },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // No tool calls, only whitespace
+    await fix.onInbound?.(makeMessageChunk(sessionId, "   \n\t  "), context);
+
+    const emptyResult = makePromptResult(505, "end_turn");
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+
+    expect(intercepted).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+
+    const promptText = (
+      writtenToChild[0] as unknown as { params: { prompt: Array<{ text: string }> } }
+    ).params.prompt[0]?.text;
+    expect(promptText).toContain("[Automated Continuation]");
+    expect(promptText).toContain("You stopped without providing a response");
+  });
 });
