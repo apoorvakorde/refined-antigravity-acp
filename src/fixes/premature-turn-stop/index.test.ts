@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
-import { ACP_METHODS, SESSION_UPDATES, type AcpStreamMessage } from "../../core/types.js";
-import { createPrematureTurnStopFix } from "./index.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  ACP_METHODS,
+  SESSION_UPDATES,
+  STOP_REASONS,
+  type AcpStreamMessage,
+} from "../../core/types.js";
+import { createMockContext } from "../../test-utils/e2e-harness.js";
+import { buildContinuationText, createPrematureTurnStopFix } from "./index.js";
 
 function makeToolCallUpdate(
   sessionId: string,
@@ -23,6 +29,36 @@ function makeToolCallUpdate(
   };
 }
 
+function makeToolCall(sessionId: string, toolCallId: string, title: string): AcpStreamMessage {
+  return {
+    jsonrpc: "2.0",
+    method: ACP_METHODS.SESSION_UPDATE,
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+        toolCallId,
+        title,
+        status: "in_progress",
+      },
+    },
+  };
+}
+
+function makeMessageChunk(sessionId: string, text: string): AcpStreamMessage {
+  return {
+    jsonrpc: "2.0",
+    method: ACP_METHODS.SESSION_UPDATE,
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+        content: { type: "text", text },
+      },
+    },
+  };
+}
+
 function makePromptResult(id: string | number, stopReason = "endTurn"): AcpStreamMessage {
   return {
     jsonrpc: "2.0",
@@ -37,7 +73,6 @@ describe("premature-turn-stop reproduction and verification", () => {
   const sessionId = "session-test-repro";
 
   it("problem: raw upstream terminates prompt turn after tool calls without emitting assistant text", () => {
-    // Simulates raw upstream behavior without any steering
     const inboundMessages: AcpStreamMessage[] = [];
 
     // 1. Tool execution completes
@@ -80,10 +115,146 @@ describe("premature-turn-stop reproduction and verification", () => {
     ).toBe(true);
   });
 
-  it("solution: proxy never invents or synthesizes fake assistant conversational text", () => {
+  it("solution: buildContinuationText produces actionable continuation directives", () => {
+    const text = buildContinuationText(15);
+    expect(text).toContain("[Automated Continuation]");
+    expect(text).toContain("15 tool calls");
+    expect(text).toContain("summarize what you have accomplished");
+  });
+
+  it("solution: intercepts premature empty turn stop, dispatches continuation prompt upstream, and preserves turn", async () => {
     const fix = createPrematureTurnStopFix();
-    // The fix must not register handlers that inject synthetic message chunks
-    expect(fix.onInbound).toBeUndefined();
-    expect(fix.onOutbound).toBeUndefined();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    // 1. Client initiates prompt turn
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 101,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId, prompt: [{ type: "text", text: "Deploy cluster" }] },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // 2. Model executes tool calls
+    await fix.onInbound?.(makeToolCall(sessionId, "t1", "Running k3s-entrypoint"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "t1", "completed"), context);
+
+    // 3. Upstream tries to terminate turn prematurely with stopReason: "endTurn" and 0 text
+    const emptyResult = makePromptResult(101, STOP_REASONS.END_TURN);
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+
+    // Result suppressed from client!
+    expect(intercepted).toEqual([]);
+
+    // Continuation prompt dispatched upstream to child process
+    expect(writtenToChild).toHaveLength(1);
+    expect(writtenToChild[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: {
+        sessionId,
+        prompt: [{ type: "text" }],
+      },
+    });
+
+    const promptText = (
+      writtenToChild[0] as unknown as { params: { prompt: Array<{ text: string }> } }
+    ).params.prompt[0]?.text;
+    expect(promptText).toContain("[Automated Continuation]");
+    expect(promptText).toContain("1 tool calls");
+
+    // 4. Upstream responds to continuation with assistant text
+    await fix.onInbound?.(
+      makeMessageChunk(sessionId, "Cluster deploy finished successfully."),
+      context,
+    );
+
+    // 5. Upstream completes continuation prompt
+    const continuationPromptId = (writtenToChild[0] as unknown as { id: string }).id;
+    const continuationComplete = makePromptResult(continuationPromptId, STOP_REASONS.END_TURN);
+    const finalResult = await fix.onInbound?.(continuationComplete, context);
+
+    // Client receives final result with original prompt ID restored!
+    expect(finalResult).toHaveLength(1);
+    expect(finalResult?.[0]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 101,
+      result: { stopReason: STOP_REASONS.END_TURN },
+    });
+  });
+
+  it("solution: does not trigger continuation when turn already emitted assistant text", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 202,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId, prompt: [{ type: "text", text: "Check status" }] },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // Tool call followed by text chunk
+    await fix.onInbound?.(makeToolCall(sessionId, "t2", "Running status"), context);
+    await fix.onInbound?.(makeMessageChunk(sessionId, "All services healthy."), context);
+
+    // Upstream finishes
+    const normalResult = makePromptResult(202, STOP_REASONS.END_TURN);
+    const result = await fix.onInbound?.(normalResult, context);
+
+    // Passthrough unchanged, no continuation sent
+    expect(result).toEqual([normalResult]);
+    expect(writtenToChild).toHaveLength(0);
+  });
+
+  it("solution: does not trigger continuation when cancelled by user", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 303,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId, prompt: [{ type: "text", text: "Long task" }] },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    await fix.onInbound?.(makeToolCall(sessionId, "t3", "Running long job"), context);
+
+    // User cancels
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_CANCEL,
+        params: { sessionId },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    const cancelResult = makePromptResult(303, STOP_REASONS.CANCELLED);
+    const result = await fix.onInbound?.(cancelResult, context);
+
+    expect(result).toEqual([cancelResult]);
+    expect(writtenToChild).toHaveLength(0);
   });
 });

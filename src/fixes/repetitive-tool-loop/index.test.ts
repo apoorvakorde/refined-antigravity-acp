@@ -374,5 +374,63 @@ describe("repetitive-tool-loop unit tests", () => {
         result: { stopReason: STOP_REASONS.END_TURN },
       });
     });
+
+    it("detects file inspection loops on the same file even when line numbers shift", async () => {
+      const fix = createRepetitiveToolLoopFix();
+      const context = createMockContext();
+      const writtenToChild: AcpStreamMessage[] = [];
+
+      context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+        writtenToChild.push(msg);
+      });
+
+      const sessionId = "s-test-file-loop";
+
+      await fix.onOutbound?.(
+        {
+          jsonrpc: "2.0",
+          id: 10,
+          method: ACP_METHODS.SESSION_PROMPT,
+          params: { sessionId, prompt: [{ type: "text", text: "Implement the feature" }] },
+        } as unknown as AcpStreamMessage,
+        context,
+      );
+
+      const makeSliceMsg = (id: string, start: number, end: number): AcpStreamMessage => ({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: id,
+            title: "Running view_file",
+            rawInput: {
+              AbsolutePath: "/app/main.ts",
+              StartLine: start,
+              EndLine: end,
+            },
+          },
+        },
+      });
+
+      // Shifting line numbers on the same file: 6 calls
+      await fix.onInbound?.(makeSliceMsg("c1", 1, 50), context);
+      await fix.onInbound?.(makeSliceMsg("c2", 40, 80), context);
+      await fix.onInbound?.(makeSliceMsg("c3", 100, 150), context);
+      await fix.onInbound?.(makeSliceMsg("c4", 200, 250), context);
+      await fix.onInbound?.(makeSliceMsg("c5", 40, 80), context);
+
+      expect(writtenToChild).toHaveLength(0);
+
+      // 6th call hits resource threshold (6)
+      const res = await fix.onInbound?.(makeSliceMsg("c6", 210, 230), context);
+      expect(res).toEqual([]);
+      expect(writtenToChild).toHaveLength(1);
+      expect(writtenToChild[0]).toMatchObject({
+        method: ACP_METHODS.SESSION_CANCEL,
+        params: { sessionId },
+      });
+    });
   });
 });

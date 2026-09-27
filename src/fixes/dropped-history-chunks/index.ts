@@ -80,40 +80,50 @@ export function utf8(bytes: Uint8Array | null): string {
   return bytes && bytes.length > 0 ? Buffer.from(bytes).toString("utf-8") : "";
 }
 
+export function isInternalProxyPrompt(text: string): boolean {
+  return /^\s*\[Automated\s+[^\]]+\]:/i.test(text);
+}
+
+function decodeUserStep(payload: Uint8Array, idx: number, timestamp?: string): ConversationStep[] {
+  const f19 = getField(payload, 19);
+  if (!f19) return [];
+  const raw = utf8(getField(f19, 2));
+  if (isInternalProxyPrompt(raw)) return [];
+  const text = stripSystemContext(stripSteeringPrefix(raw)).trim();
+  return text ? [{ kind: "user", idx, text, timestamp }] : [];
+}
+
+function decodeAgentStep(payload: Uint8Array, idx: number, timestamp?: string): ConversationStep[] {
+  const f20 = getField(payload, 20);
+  if (!f20) return [];
+  const steps: ConversationStep[] = [];
+  const thought = utf8(getField(f20, 3)).trim();
+  if (thought) steps.push({ kind: "thought", idx, text: thought, timestamp });
+  const text = sanitizeText(utf8(getField(f20, 1)));
+  if (text) steps.push({ kind: "assistant", idx, text, timestamp });
+  const call = getField(f20, 7);
+  const callId = call ? utf8(getField(call, 1)) : "";
+  if (callId) {
+    steps.push({
+      kind: "tool_call",
+      idx,
+      callId,
+      name: utf8(getField(call!, 2)),
+      rawInputJson: utf8(getField(call!, 3)),
+      timestamp,
+    });
+  }
+  return steps;
+}
+
 export function decodeStep(
   stepType: number,
   payload: Uint8Array,
   idx: number,
   timestamp?: string,
 ): ConversationStep[] {
-  if (stepType === STEP_TYPE_USER) {
-    const f19 = getField(payload, 19);
-    if (!f19) return [];
-    const text = stripSystemContext(stripSteeringPrefix(utf8(getField(f19, 2)))).trim();
-    return text ? [{ kind: "user", idx, text, timestamp }] : [];
-  }
-  if (stepType === STEP_TYPE_AGENT) {
-    const f20 = getField(payload, 20);
-    if (!f20) return [];
-    const steps: ConversationStep[] = [];
-    const thought = utf8(getField(f20, 3)).trim();
-    if (thought) steps.push({ kind: "thought", idx, text: thought, timestamp });
-    const text = sanitizeText(utf8(getField(f20, 1)));
-    if (text) steps.push({ kind: "assistant", idx, text, timestamp });
-    const call = getField(f20, 7);
-    const callId = call ? utf8(getField(call, 1)) : "";
-    if (callId) {
-      steps.push({
-        kind: "tool_call",
-        idx,
-        callId,
-        name: utf8(getField(call!, 2)),
-        rawInputJson: utf8(getField(call!, 3)),
-        timestamp,
-      });
-    }
-    return steps;
-  }
+  if (stepType === STEP_TYPE_USER) return decodeUserStep(payload, idx, timestamp);
+  if (stepType === STEP_TYPE_AGENT) return decodeAgentStep(payload, idx, timestamp);
   return [];
 }
 

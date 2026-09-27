@@ -125,6 +125,41 @@ export function computeToolCallSignature(toolName: string, rawInput: unknown): s
   return `${toolName}:${JSON.stringify(canonical)}`;
 }
 
+const RESOURCE_PATH_KEYS = [
+  "AbsolutePath",
+  "TargetFile",
+  "targetFile",
+  "target_file",
+  "filePath",
+  "file_path",
+  "path",
+] as const;
+
+function parseRawObject(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  return typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+}
+
+export function extractTargetResource(rawInput: unknown): string | undefined {
+  const obj = parseRawObject(rawInput);
+  if (!obj) return undefined;
+  for (const key of RESOURCE_PATH_KEYS) {
+    const val = obj[key];
+    if (typeof val === "string") return val;
+  }
+  return undefined;
+}
+
 export interface CycleDetectionResult {
   isLoop: boolean;
   cycleLength: number;
@@ -202,12 +237,14 @@ interface SessionTurnState {
   hasPollingIntent: boolean;
   requestedIterations?: number | undefined;
   signatures: string[];
+  resourceSignatures: string[];
   loopInterrupted: boolean;
   steerPending: boolean;
   steerPromptId?: string | number | undefined;
   steerCount: number;
   lastLoopResult?: CycleDetectionResult | undefined;
   lastToolName?: string | undefined;
+  lastTargetResource?: string | undefined;
 }
 
 function resolveSingleThreshold(
@@ -222,6 +259,32 @@ function resolveSingleThreshold(
   return requestedIterations ? Math.max(requestedIterations + 2, basePolling) : basePolling;
 }
 
+function detectResourceLoop(
+  state: SessionTurnState,
+  toolName: string,
+  rawInput: unknown,
+  singleThreshold: number,
+  options: RepetitiveToolLoopOptions,
+): CycleDetectionResult | null {
+  if (!READ_ONLY_TOOLS.has(toolName)) return null;
+  const resource = extractTargetResource(rawInput);
+  if (!resource) return null;
+  state.resourceSignatures.push(`${toolName}:${resource}`);
+  const resourceThreshold = state.hasPollingIntent
+    ? singleThreshold
+    : Math.max((options.readOnlySingleThreshold ?? 3) * 2, 6);
+  const resCycle = detectCycle(state.resourceSignatures, {
+    maxPeriod: options.maxPeriod ?? 4,
+    singleToolThreshold: resourceThreshold,
+    cycleThreshold: options.cycleThreshold ?? 3,
+  });
+  if (resCycle.isLoop) {
+    state.lastTargetResource = resource;
+    return resCycle;
+  }
+  return null;
+}
+
 export class RepetitiveToolLoopTracker {
   private readonly sessions = new Map<string, SessionTurnState>();
   private readonly promptIdToSessionId = new Map<string | number, string>();
@@ -231,6 +294,7 @@ export class RepetitiveToolLoopTracker {
     if (!state) {
       state = {
         signatures: [],
+        resourceSignatures: [],
         loopInterrupted: false,
         userPromptText: "",
         hasPollingIntent: false,
@@ -249,12 +313,14 @@ export class RepetitiveToolLoopTracker {
     state.hasPollingIntent = hasPollingIntent(promptText);
     state.requestedIterations = extractRequestedIterations(promptText);
     state.signatures = [];
+    state.resourceSignatures = [];
     state.loopInterrupted = false;
     state.steerPending = false;
     state.steerPromptId = undefined;
     state.steerCount = 0;
     state.lastLoopResult = undefined;
     state.lastToolName = undefined;
+    state.lastTargetResource = undefined;
     if (promptId !== undefined && promptId !== null) {
       this.promptIdToSessionId.set(promptId, sessionId);
     }
@@ -292,10 +358,18 @@ export class RepetitiveToolLoopTracker {
       cycleThreshold: options.cycleThreshold ?? 3,
     });
 
-    if (result.isLoop) {
+    const loopResult = result.isLoop
+      ? result
+      : detectResourceLoop(state, toolName, rawInput, singleThreshold, options);
+
+    if (loopResult && loopResult.isLoop) {
       state.loopInterrupted = true;
-      state.lastLoopResult = result;
+      state.lastLoopResult = loopResult;
       state.lastToolName = toolName;
+      if (!state.lastTargetResource) {
+        state.lastTargetResource = extractTargetResource(rawInput);
+      }
+      return loopResult;
     }
 
     return result;
@@ -353,10 +427,15 @@ export class RepetitiveToolLoopTracker {
     return this.sessions.get(sessionId)?.lastLoopResult;
   }
 
+  getLastTargetResource(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.lastTargetResource;
+  }
+
   resetSignaturesForSteering(sessionId: string): void {
     const s = this.sessions.get(sessionId);
     if (s) {
       s.signatures = [];
+      s.resourceSignatures = [];
       s.loopInterrupted = false;
     }
   }
@@ -438,22 +517,48 @@ function handleSteerPromptCompletion(
   return null;
 }
 
+export function buildSteeringText(
+  toolName: string,
+  targetResource: string | undefined,
+  repetitions: number,
+  steerCount: number,
+): string {
+  if (steerCount > 0) {
+    return (
+      `[Automated Steering]: You are still repeatedly executing '${toolName}'. Repetition is halted. ` +
+      `Summarize what you have accomplished so far, explain what is blocking you or what you found, and report your status to the user immediately.`
+    );
+  }
+  if (READ_ONLY_TOOLS.has(toolName)) {
+    const targetDesc = targetResource ? ` on '${targetResource}'` : "";
+    return (
+      `[Automated Steering]: You have repeatedly executed '${toolName}'${targetDesc} without making progress. ` +
+      `Do not re-read or inspect this file again. You already have the code context you need. ` +
+      `Analyze your findings, decide on the required code modifications or commands, and proceed immediately with making changes to bring the task to completion.`
+    );
+  }
+  return (
+    `[Automated Steering]: You have repeatedly executed '${toolName}' (${repetitions} times) without progress. ` +
+    `Stop repeating this action. Evaluate your current results, decide on the required next steps or changes, and proceed immediately to complete the user's task.`
+  );
+}
+
 async function dispatchSteeringPrompt(
   sessionId: string,
   tracker: RepetitiveToolLoopTracker,
   context: InboundContext,
 ): Promise<boolean> {
   tracker.setSteerPending(sessionId, false);
+  const currentSteerCount = tracker.getSteerCount(sessionId);
   tracker.incrementSteerCount(sessionId);
   tracker.resetSignaturesForSteering(sessionId);
 
   const toolName = tracker.getLastToolName(sessionId) ?? "tool";
+  const targetResource = tracker.getLastTargetResource(sessionId);
   const loopResult = tracker.getLastLoopResult(sessionId);
   const repetitions = loopResult?.repetitions ?? 3;
 
-  const steeringText =
-    `[Automated Steering]: You have repeatedly executed '${toolName}' (${repetitions} times consecutively with identical parameters) without progress. ` +
-    `Is this expected? If you are polling or waiting on an external state change, explain what you are waiting for. Otherwise, please stop repeating this action, evaluate your findings, and try a different approach or report your status to the user.`;
+  const steeringText = buildSteeringText(toolName, targetResource, repetitions, currentSteerCount);
 
   const newSteerPromptId = `steer_${sessionId}_${Date.now()}`;
   tracker.setSteerPromptId(sessionId, newSteerPromptId);
@@ -496,18 +601,18 @@ async function settleInterruptedPromptResponse(
 ): Promise<AcpStreamMessage[] | null> {
   if (!("result" in msg)) return null;
 
-  const steerResult = handleSteerPromptCompletion(msg, sessionId, tracker);
-  if (steerResult) return steerResult;
-
-  const res = extractCancelledResult(msg, sessionId, tracker);
-  if (!res) return null;
-
-  const maxSteers = options.maxSteersPerTurn ?? 1;
+  const maxSteers = options.maxSteersPerTurn ?? 2;
   const canSteer =
     tracker.isSteerPending(sessionId) && tracker.getSteerCount(sessionId) < maxSteers;
   if (canSteer && (await dispatchSteeringPrompt(sessionId, tracker, context))) {
     return [];
   }
+
+  const steerResult = handleSteerPromptCompletion(msg, sessionId, tracker);
+  if (steerResult) return steerResult;
+
+  const res = extractCancelledResult(msg, sessionId, tracker);
+  if (!res) return null;
 
   tracker.startTurn(sessionId);
   return [{ ...msg, result: { ...res, stopReason: STOP_REASONS.END_TURN } }];
