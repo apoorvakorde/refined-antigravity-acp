@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AcpStreamMessage } from "../../core/types.js";
 import { createMockContext } from "../../test-utils/e2e-harness.js";
 import {
+  DEFAULT_CANCELLATION_TIMEOUT_MS,
   createCancellationLeakFix,
   extractMessageChunkText,
   interruptionCleanupFix,
@@ -258,6 +259,9 @@ describe("interruptionCleanupFix", () => {
       result: { stopReason: "cancelled" },
     });
 
+    // Session cache should have needsRecycle flagged so supervisor can recycle process before next prompt
+    expect(mockCtx.sessionCache.sessions.get("sess-timeout-test")?.needsRecycle).toBe(true);
+
     // Late response arriving after fallback is dropped
     const lateResponse: AcpStreamMessage = {
       jsonrpc: "2.0",
@@ -266,6 +270,13 @@ describe("interruptionCleanupFix", () => {
     } as unknown as AcpStreamMessage;
     const lateRes = fix.onInbound?.(lateResponse, mockCtx);
     expect(lateRes).toEqual([]);
+  });
+
+  it("sets DEFAULT_CANCELLATION_TIMEOUT_MS strictly below Paseo's 2000ms interrupt watchdog", () => {
+    // Paseo's agent-manager.js uses const INTERRUPT_SESSION_TIMEOUT_MS = 2000;
+    // Our timeout must be significantly lower (e.g. 800ms) to ensure prompt settlement before Paseo crashes
+    expect(DEFAULT_CANCELLATION_TIMEOUT_MS).toBe(800);
+    expect(DEFAULT_CANCELLATION_TIMEOUT_MS).toBeLessThan(2000);
   });
 
   it("delays subsequent outbound prompt until in-flight cancellation has settled", async () => {

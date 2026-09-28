@@ -24,7 +24,7 @@ import {
   type OutboundContext,
   type SessionUpdateParams,
 } from "../../core/types.js";
-import { extractSessionId } from "../../core/session-cache.js";
+import { extractSessionId, getOrCreateSession } from "../../core/session-cache.js";
 
 export const CANCELLATION_ERROR_REGEX =
   /^(?:context\s+canceled)?\s*The\s+request\s+was\s+cancelled\s+by\s+the\s+client\.?$/i;
@@ -32,7 +32,12 @@ export const CANCELLATION_ERROR_REGEX =
 export const CONCURRENT_RECEIVE_STEPS_REGEX =
   /^Agent connection was lost and could not be re-established:\s*Concurrent receive_steps\(\) calls are not supported on this connection\.?$/i;
 
-export const DEFAULT_CANCELLATION_TIMEOUT_MS = 2500;
+/**
+ * Fallback cancellation timeout. Must be well below Paseo's 2000ms hard interrupt watchdog
+ * (`INTERRUPT_SESSION_TIMEOUT_MS = 2000` in Paseo's agent-manager.js) to guarantee prompt
+ * settlement before Paseo force-cancels and crashes with "A foreground turn is already active".
+ */
+export const DEFAULT_CANCELLATION_TIMEOUT_MS = 800;
 
 export function isCancellationText(text: string): boolean {
   const trimmed = text.trim();
@@ -126,9 +131,8 @@ function handleOutboundCancel(
     if (current && current.promptId === promptId) {
       state.cancellingSessions.delete(sessionId);
       state.suppressedLateResponseIds.add(promptId);
-      if (context.session) {
-        context.session.needsRecycle = true;
-      }
+      const session = context.session ?? getOrCreateSession(context.sessionCache, sessionId);
+      session.needsRecycle = true;
       const cancelResponse: AcpStreamMessage = {
         jsonrpc: "2.0",
         id: promptId,
