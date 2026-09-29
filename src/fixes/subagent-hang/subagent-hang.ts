@@ -11,6 +11,7 @@
 import {
   ACP_METHODS,
   isJsonRpcRequest,
+  isJsonRpcResponse,
   type AcpStreamMessage,
   type AcpFix,
   type StderrContext,
@@ -117,9 +118,8 @@ export class HangDetector {
   }
 
   processInbound(msg: AcpStreamMessage): void {
-    if ("id" in msg && msg.id !== null && msg.id !== undefined) {
-      this.resolvePrompt(msg.id);
-    }
+    if (!isJsonRpcResponse(msg)) return;
+    this.resolvePrompt(msg.id);
   }
 
   dispose(): void {

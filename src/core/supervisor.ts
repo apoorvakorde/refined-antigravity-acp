@@ -16,6 +16,7 @@ import {
   type StderrContext,
   type SessionCache,
   type UrlRewriter,
+  isJsonRpcResponse,
 } from "./types.js";
 import type { AcpPipeline } from "./pipeline.js";
 import {
@@ -252,7 +253,7 @@ export class ProcessSupervisor implements CoreContext {
   }
 
   private tryHandleSuppressedResponse(msg: AcpStreamMessage): boolean {
-    if (!("id" in msg) || msg.id === null || msg.id === undefined) return false;
+    if (!isJsonRpcResponse(msg)) return false;
     if (this.suppressedResponseIds.has(msg.id)) {
       this.suppressedResponseIds.delete(msg.id);
       console.error(`[refined-antigravity-acp] Dropped late response for hung prompt ${msg.id}`);

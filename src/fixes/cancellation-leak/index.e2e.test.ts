@@ -161,14 +161,17 @@ describe("cancellation-leak e2e", () => {
     await new Promise((resolve) => setTimeout(resolve, 800));
 
     // Send session/cancel
+    const t0 = Date.now();
     await client.send({
       jsonrpc: "2.0",
       method: "session/cancel",
       params: { sessionId },
     } as unknown as AcpStreamMessage);
 
-    // Prompt response must settle as cancelled
-    const res1 = await client.waitForResponse(p1.id, 5000);
+    // Prompt response must settle as cancelled within 1500ms (< Paseo's 2000ms watchdog)
+    const res1 = await client.waitForResponse(p1.id, 1500);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(1500);
     expect("result" in res1 && (res1.result as { stopReason?: string }).stopReason).toBe(
       "cancelled",
     );

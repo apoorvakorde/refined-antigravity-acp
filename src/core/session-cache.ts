@@ -1,4 +1,9 @@
-import type { AcpStreamMessage, CachedSessionMetadata, SessionCache } from "./types.js";
+import {
+  type AcpStreamMessage,
+  type CachedSessionMetadata,
+  type SessionCache,
+  isJsonRpcResponse,
+} from "./types.js";
 
 export function createSessionCache(): SessionCache {
   return {
@@ -37,7 +42,7 @@ export function resolveResponseSession(
   msg: AcpStreamMessage,
   cache?: SessionCache,
 ): string | undefined {
-  if (!cache || !("id" in msg) || msg.id === null || msg.id === undefined) return undefined;
+  if (!cache || !isJsonRpcResponse(msg)) return undefined;
   const sessionId = cache.pendingRequestSessions.get(msg.id);
   if (sessionId !== undefined) cache.pendingRequestSessions.delete(msg.id);
   return sessionId;

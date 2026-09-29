@@ -11,6 +11,7 @@
 import {
   ACP_METHODS,
   isJsonRpcRequest,
+  isJsonRpcResponse,
   type AcpStreamMessage,
   type AcpFix,
   type InboundContext,
@@ -165,7 +166,7 @@ export function createActiveTurnCollisionFix(options?: UserSteeringOptions): Acp
       msg: AcpStreamMessage,
       context: InboundContext,
     ): Promise<AcpStreamMessage[]> => {
-      if (!("id" in msg) || msg.id === null || msg.id === undefined) return [msg];
+      if (!isJsonRpcResponse(msg)) return [msg];
       const pending = pendingPromptRetries.get(msg.id);
       if (!pending) return [msg];
 

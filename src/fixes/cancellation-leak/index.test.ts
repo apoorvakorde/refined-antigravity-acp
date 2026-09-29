@@ -272,6 +272,69 @@ describe("interruptionCleanupFix", () => {
     expect(lateRes).toEqual([]);
   });
 
+  it("inbound server request (e.g. session/request_permission) with colliding id does not clear prompt tracking and allows fallback cancellation to settle", async () => {
+    let forwardedInbound: AcpStreamMessage | null = null;
+    let recycleSession: unknown = null;
+    const mockCtx = createMockContext({
+      forwardInbound: (msg) => {
+        forwardedInbound = msg;
+      },
+      triggerRecycle: async (session) => {
+        recycleSession = session;
+      },
+    });
+
+    const fix = createCancellationLeakFix({ timeoutMs: 40 });
+
+    // Client sends session/prompt with id: 1
+    const promptMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "session/prompt",
+      params: {
+        sessionId: "sess-perm-collision",
+        prompt: [{ type: "text", text: "run bash command" }],
+      },
+    } as unknown as AcpStreamMessage;
+
+    await fix.onOutbound?.(promptMsg, mockCtx);
+
+    // Upstream server sends session/request_permission with id: 1 (server-to-client request!)
+    const permReqMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "session/request_permission",
+      params: { sessionId: "sess-perm-collision", options: [] },
+    } as unknown as AcpStreamMessage;
+
+    // This inbound request must NOT clear prompt tracking or cancel fallback timers
+    const permResult = fix.onInbound?.(permReqMsg, mockCtx);
+    expect(permResult).toEqual([permReqMsg]);
+
+    // Now client issues session/cancel (e.g. user interrupted in Paseo)
+    const cancelMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId: "sess-perm-collision" },
+    } as unknown as AcpStreamMessage;
+
+    await fix.onOutbound?.(cancelMsg, mockCtx);
+
+    // Wait for fallback timer (40ms)
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // Fallback cancellation must have synthesized the prompt response with id: 1
+    expect(forwardedInbound).toEqual({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { stopReason: "cancelled" },
+    });
+
+    // Process recycling must be flagged and triggered
+    expect(mockCtx.sessionCache.sessions.get("sess-perm-collision")?.needsRecycle).toBe(true);
+    expect(recycleSession).toBe(mockCtx.sessionCache.sessions.get("sess-perm-collision"));
+  });
+
   it("sets DEFAULT_CANCELLATION_TIMEOUT_MS strictly below Paseo's 2000ms interrupt watchdog", () => {
     // Paseo's agent-manager.js uses const INTERRUPT_SESSION_TIMEOUT_MS = 2000;
     // Our timeout must be significantly lower (e.g. 800ms) to ensure prompt settlement before Paseo crashes

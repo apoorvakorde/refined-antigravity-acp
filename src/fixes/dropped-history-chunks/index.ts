@@ -15,6 +15,7 @@ import {
   SESSION_UPDATES,
   RECYCLE_ID_PREFIX,
   isJsonRpcRequest,
+  isJsonRpcResponse,
   isMethod,
   type AcpStreamMessage,
   type AcpFix,
@@ -263,7 +264,7 @@ export function synthesizeReplayUpdates(
 const pendingReplayLoads = new Map<string | number, string>();
 
 function consumePendingLoadSession(msg: AcpStreamMessage): string | undefined {
-  if (!("id" in msg) || msg.id === null || msg.id === undefined) return undefined;
+  if (!isJsonRpcResponse(msg)) return undefined;
   const sessionId = pendingReplayLoads.get(msg.id);
   if (sessionId !== undefined) {
     pendingReplayLoads.delete(msg.id);

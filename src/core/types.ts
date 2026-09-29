@@ -103,11 +103,36 @@ export function isJsonRpcNotification(msg: AcpStreamMessage): msg is JsonRpcNoti
 export function isJsonRpcSuccessResponse<T = unknown>(
   msg: AcpStreamMessage,
 ): msg is JsonRpcSuccessResponse<T> {
-  return "result" in msg && "id" in msg;
+  return (
+    !("method" in msg) && "result" in msg && "id" in msg && msg.id !== null && msg.id !== undefined
+  );
 }
 
 export function isJsonRpcErrorResponse(msg: AcpStreamMessage): msg is JsonRpcErrorResponse {
-  return "error" in msg && "id" in msg && typeof msg.error === "object" && msg.error !== null;
+  return (
+    !("method" in msg) &&
+    "error" in msg &&
+    "id" in msg &&
+    msg.id !== null &&
+    msg.id !== undefined &&
+    typeof msg.error === "object" &&
+    msg.error !== null
+  );
+}
+
+export type JsonRpcValidResponse<T = unknown> = (
+  | JsonRpcSuccessResponse<T>
+  | JsonRpcErrorResponse
+) & {
+  id: string | number;
+};
+
+export function isJsonRpcResponse(msg: AcpStreamMessage): msg is JsonRpcValidResponse {
+  return (
+    (isJsonRpcSuccessResponse(msg) || isJsonRpcErrorResponse(msg)) &&
+    msg.id !== null &&
+    msg.id !== undefined
+  );
 }
 
 export function isMethod<M extends string>(
@@ -141,6 +166,7 @@ export interface CachedSessionMetadata {
   lastConfigOptions: Map<string, CachedConfigOption>;
   mcpServers?: unknown[];
   needsRecycle?: boolean;
+  activePromptId?: string | number | undefined;
   /** Fixes can store arbitrary session-scoped state here */
   fixData?: Map<string, unknown>;
 }

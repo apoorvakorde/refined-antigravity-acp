@@ -11,7 +11,9 @@ import type {
 import { createSessionCache } from "../core/session-cache.js";
 import type { McpProxyPool } from "../fixes/stale-mcp-endpoints/index.js";
 
-export function createMockContext(): InboundContext & OutboundContext & StderrContext {
+export function createMockContext(
+  overrides?: Partial<InboundContext & OutboundContext & StderrContext>,
+): InboundContext & OutboundContext & StderrContext {
   return {
     sessionCache: createSessionCache(),
     forwardInbound: () => {},
@@ -19,6 +21,7 @@ export function createMockContext(): InboundContext & OutboundContext & StderrCo
     sendInternalRequest: async () => ({}) as AcpStreamMessage,
     triggerRecycle: async () => {},
     declareHang: () => {},
+    ...overrides,
   };
 }
 

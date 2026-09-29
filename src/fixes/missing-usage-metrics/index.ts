@@ -14,6 +14,7 @@ import {
   ACP_METHODS,
   SESSION_UPDATES,
   isJsonRpcRequest,
+  isJsonRpcResponse,
   type AcpFix,
   type AcpStreamMessage,
   type InboundContext,
@@ -138,7 +139,7 @@ export function createMissingUsageMetricsFix(
       msg: AcpStreamMessage,
       context: InboundContext,
     ): Promise<AcpStreamMessage[]> => {
-      if (!("id" in msg) || msg.id === null || msg.id === undefined) return [msg];
+      if (!isJsonRpcResponse(msg)) return [msg];
       if (!pendingPromptSessions.has(msg.id)) return [msg];
 
       const sessionId = context.session?.sessionId ?? pendingPromptSessions.get(msg.id);

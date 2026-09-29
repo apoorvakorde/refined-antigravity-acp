@@ -18,13 +18,14 @@ import {
   SESSION_UPDATES,
   STOP_REASONS,
   isMethod,
+  isJsonRpcResponse,
   type AcpFix,
   type AcpStreamMessage,
   type InboundContext,
   type OutboundContext,
   type SessionUpdateParams,
 } from "../../core/types.js";
-import { extractSessionId, getOrCreateSession } from "../../core/session-cache.js";
+import { extractSessionId, getSession, getOrCreateSession } from "../../core/session-cache.js";
 
 export const CANCELLATION_ERROR_REGEX =
   /^(?:context\s+canceled)?\s*The\s+request\s+was\s+cancelled\s+by\s+the\s+client\.?$/i;
@@ -91,6 +92,7 @@ export interface CancellationOptions {
 
 async function handleOutboundPrompt(
   msg: AcpStreamMessage,
+  context: OutboundContext,
   state: CancellationState,
 ): Promise<void> {
   const sessionId = extractSessionId(msg);
@@ -102,6 +104,8 @@ async function handleOutboundPrompt(
     }
     if (id !== undefined && id !== null) {
       state.activePrompts.set(sessionId, id);
+      const session = context.session ?? getOrCreateSession(context.sessionCache, sessionId);
+      session.activePromptId = id;
     }
   }
 }
@@ -115,10 +119,14 @@ function handleOutboundCancel(
   const sessionId = extractSessionId(msg);
   if (!sessionId) return;
 
-  const promptId = state.activePrompts.get(sessionId);
+  const session = context.session ?? getSession(context.sessionCache, sessionId);
+  const promptId = state.activePrompts.get(sessionId) ?? session?.activePromptId;
   if (promptId === undefined) return;
 
   state.activePrompts.delete(sessionId);
+  if (session) {
+    session.activePromptId = undefined;
+  }
   if (state.cancellingSessions.has(sessionId)) return;
 
   let resolveFn!: () => void;
@@ -131,8 +139,8 @@ function handleOutboundCancel(
     if (current && current.promptId === promptId) {
       state.cancellingSessions.delete(sessionId);
       state.suppressedLateResponseIds.add(promptId);
-      const session = context.session ?? getOrCreateSession(context.sessionCache, sessionId);
-      session.needsRecycle = true;
+      const targetSession = context.session ?? getOrCreateSession(context.sessionCache, sessionId);
+      targetSession.needsRecycle = true;
       const cancelResponse: AcpStreamMessage = {
         jsonrpc: "2.0",
         id: promptId,
@@ -140,6 +148,7 @@ function handleOutboundCancel(
       };
       context.forwardInbound?.(cancelResponse);
       resolveFn();
+      void context.triggerRecycle?.(targetSession);
     }
   }, timeoutMs);
   timer.unref?.();
@@ -154,11 +163,12 @@ function handleOutboundCancel(
 
 function handleInboundPromptId(
   msg: AcpStreamMessage,
-  _context: InboundContext,
+  context: InboundContext,
   state: CancellationState,
 ): boolean {
-  const id = (msg as { id?: string | number | null }).id;
-  if (id === null || id === undefined) return false;
+  if (!isJsonRpcResponse(msg)) return false;
+
+  const id = msg.id;
 
   if (state.suppressedLateResponseIds.has(id)) {
     state.suppressedLateResponseIds.delete(id);
@@ -177,6 +187,10 @@ function handleInboundPromptId(
   for (const [sessId, promptId] of state.activePrompts.entries()) {
     if (promptId === id) {
       state.activePrompts.delete(sessId);
+      const session = context.session ?? getSession(context.sessionCache, sessId);
+      if (session) {
+        session.activePromptId = undefined;
+      }
       break;
     }
   }
@@ -210,7 +224,7 @@ export function createCancellationLeakFix(options?: CancellationOptions): AcpFix
 
     async onOutbound(msg: AcpStreamMessage, context: OutboundContext): Promise<AcpStreamMessage> {
       if (isMethod(msg, ACP_METHODS.SESSION_PROMPT)) {
-        await handleOutboundPrompt(msg, state);
+        await handleOutboundPrompt(msg, context, state);
       } else if (isMethod(msg, ACP_METHODS.SESSION_CANCEL)) {
         handleOutboundCancel(msg, context, state, timeoutMs);
       }
