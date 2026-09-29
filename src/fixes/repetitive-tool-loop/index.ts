@@ -24,7 +24,7 @@ import {
   type OutboundContext,
   type SessionUpdateParams,
 } from "../../core/types.js";
-import { extractSessionId } from "../../core/session-cache.js";
+import { extractSessionId, trackPendingRequestSession } from "../../core/session-cache.js";
 
 export const IGNORED_METADATA_KEYS = new Set(["toolaction", "toolsummary", "description"]);
 
@@ -242,10 +242,16 @@ interface SessionTurnState {
   steerPending: boolean;
   steerPromptId?: string | number | undefined;
   steerCount: number;
+  clientCancelled?: boolean;
   lastLoopResult?: CycleDetectionResult | undefined;
   lastToolName?: string | undefined;
   lastTargetResource?: string | undefined;
 }
+
+export const DEFAULT_READ_ONLY_SINGLE_THRESHOLD = 6;
+export const DEFAULT_MUTATING_SINGLE_THRESHOLD = 10;
+export const DEFAULT_CYCLE_THRESHOLD = 4;
+export const DEFAULT_RESOURCE_LOOP_THRESHOLD = 15;
 
 function resolveSingleThreshold(
   isReadOnly: boolean,
@@ -253,8 +259,8 @@ function resolveSingleThreshold(
   requestedIterations: number | undefined,
   options: RepetitiveToolLoopOptions,
 ): number {
-  if (isReadOnly) return options.readOnlySingleThreshold ?? 3;
-  if (!hasPolling) return options.mutatingSingleThreshold ?? 5;
+  if (isReadOnly) return options.readOnlySingleThreshold ?? DEFAULT_READ_ONLY_SINGLE_THRESHOLD;
+  if (!hasPolling) return options.mutatingSingleThreshold ?? DEFAULT_MUTATING_SINGLE_THRESHOLD;
   const basePolling = options.pollingSingleThreshold ?? 30;
   return requestedIterations ? Math.max(requestedIterations + 2, basePolling) : basePolling;
 }
@@ -272,11 +278,13 @@ function detectResourceLoop(
   state.resourceSignatures.push(`${toolName}:${resource}`);
   const resourceThreshold = state.hasPollingIntent
     ? singleThreshold
-    : Math.max((options.readOnlySingleThreshold ?? 3) * 2, 6);
+    : options.readOnlySingleThreshold !== undefined
+      ? options.readOnlySingleThreshold * 2
+      : DEFAULT_RESOURCE_LOOP_THRESHOLD;
   const resCycle = detectCycle(state.resourceSignatures, {
     maxPeriod: options.maxPeriod ?? 4,
     singleToolThreshold: resourceThreshold,
-    cycleThreshold: options.cycleThreshold ?? 3,
+    cycleThreshold: options.cycleThreshold ?? DEFAULT_CYCLE_THRESHOLD,
   });
   if (resCycle.isLoop) {
     state.lastTargetResource = resource;
@@ -318,12 +326,22 @@ export class RepetitiveToolLoopTracker {
     state.steerPending = false;
     state.steerPromptId = undefined;
     state.steerCount = 0;
+    state.clientCancelled = false;
     state.lastLoopResult = undefined;
     state.lastToolName = undefined;
     state.lastTargetResource = undefined;
     if (promptId !== undefined && promptId !== null) {
       this.promptIdToSessionId.set(promptId, sessionId);
     }
+  }
+
+  isClientCancelled(sessionId: string): boolean {
+    return this.sessions.get(sessionId)?.clientCancelled ?? false;
+  }
+
+  setClientCancelled(sessionId: string, cancelled: boolean): void {
+    const s = this.sessions.get(sessionId);
+    if (s) s.clientCancelled = cancelled;
   }
 
   getSessionIdForPrompt(promptId: string | number): string | undefined {
@@ -345,6 +363,11 @@ export class RepetitiveToolLoopTracker {
     state.signatures.push(signature);
 
     const isReadOnly = READ_ONLY_TOOLS.has(toolName);
+    if (!isReadOnly) {
+      // Mutating actions modify files or state; reset purely read inspection tracking
+      state.resourceSignatures = [];
+    }
+
     const singleThreshold = resolveSingleThreshold(
       isReadOnly,
       state.hasPollingIntent,
@@ -355,7 +378,7 @@ export class RepetitiveToolLoopTracker {
     const result = detectCycle(state.signatures, {
       maxPeriod: options.maxPeriod ?? 4,
       singleToolThreshold: singleThreshold,
-      cycleThreshold: options.cycleThreshold ?? 3,
+      cycleThreshold: options.cycleThreshold ?? DEFAULT_CYCLE_THRESHOLD,
     });
 
     const loopResult = result.isLoop
@@ -512,7 +535,10 @@ function handleSteerPromptCompletion(
   if (steerPromptId !== undefined && promptId === steerPromptId) {
     const originalPromptId = tracker.getActivePromptId(sessionId);
     tracker.clearSteerPrompt(sessionId);
-    return [{ ...msg, id: originalPromptId ?? null }];
+    if (originalPromptId !== undefined && originalPromptId !== null) {
+      return [{ ...msg, id: originalPromptId }];
+    }
+    return [];
   }
   return null;
 }
@@ -562,6 +588,7 @@ async function dispatchSteeringPrompt(
 
   const newSteerPromptId = `steer_${sessionId}_${Date.now()}`;
   tracker.setSteerPromptId(sessionId, newSteerPromptId);
+  trackPendingRequestSession(context.sessionCache, newSteerPromptId, sessionId);
 
   try {
     await context.writeToChild({
@@ -599,23 +626,27 @@ async function settleInterruptedPromptResponse(
   context: InboundContext,
   options: RepetitiveToolLoopOptions,
 ): Promise<AcpStreamMessage[] | null> {
+  const steerResult = handleSteerPromptCompletion(msg, sessionId, tracker);
+  if (steerResult) return steerResult;
+
   if (!("result" in msg)) return null;
 
   const maxSteers = options.maxSteersPerTurn ?? 2;
+  const isClientCancelled = tracker.isClientCancelled(sessionId);
   const canSteer =
-    tracker.isSteerPending(sessionId) && tracker.getSteerCount(sessionId) < maxSteers;
+    !isClientCancelled &&
+    tracker.isSteerPending(sessionId) &&
+    tracker.getSteerCount(sessionId) < maxSteers;
   if (canSteer && (await dispatchSteeringPrompt(sessionId, tracker, context))) {
     return [];
   }
 
-  const steerResult = handleSteerPromptCompletion(msg, sessionId, tracker);
-  if (steerResult) return steerResult;
-
   const res = extractCancelledResult(msg, sessionId, tracker);
   if (!res) return null;
 
+  const stopReason = isClientCancelled ? STOP_REASONS.CANCELLED : STOP_REASONS.END_TURN;
   tracker.startTurn(sessionId);
-  return [{ ...msg, result: { ...res, stopReason: STOP_REASONS.END_TURN } }];
+  return [{ ...msg, result: { ...res, stopReason } }];
 }
 
 function resolveSessionId(
@@ -667,7 +698,12 @@ export function createRepetitiveToolLoopFix(options: RepetitiveToolLoopOptions =
         const promptText = extractPromptText(msg);
         tracker.startTurn(sessionId, promptId, promptText);
       } else if (isMethod(msg, ACP_METHODS.SESSION_CANCEL)) {
-        tracker.clearSteerPrompt(sessionId);
+        // Do NOT clear steerPromptId here! If an automated steering prompt is currently executing,
+        // cancelling will cause upstream to respond with { id: steerPromptId, result: { stopReason: "cancelled" } }.
+        // We must preserve steerPromptId so handleSteerPromptCompletion can map it back to the client's
+        // activePromptId and deliver a clean cancellation response instead of leaking an unknown steer_ ID to the client.
+        tracker.setClientCancelled(sessionId, true);
+        tracker.setSteerPending(sessionId, false);
       }
 
       return msg;

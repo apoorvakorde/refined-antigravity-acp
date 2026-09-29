@@ -185,26 +185,52 @@ describe("repetitive-tool-loop unit tests", () => {
       const tracker = new RepetitiveToolLoopTracker();
       const session = "s1";
 
-      // view_file is read-only -> threshold 3
-      tracker.recordToolCall(session, "view_file", { path: "f1" });
-      tracker.recordToolCall(session, "view_file", { path: "f1" });
-      const r3 = tracker.recordToolCall(session, "view_file", { path: "f1" });
-      expect(r3.isLoop).toBe(true);
+      // view_file is read-only -> threshold 6
+      for (let i = 1; i <= 5; i++) {
+        expect(tracker.recordToolCall(session, "view_file", { path: "f1" }).isLoop).toBe(false);
+      }
+      const r6 = tracker.recordToolCall(session, "view_file", { path: "f1" });
+      expect(r6.isLoop).toBe(true);
 
       tracker.startTurn(session);
-      // run_command is mutating -> default threshold 5 without polling intent
-      tracker.recordToolCall(session, "run_command", { CommandLine: "curl localhost" });
-      tracker.recordToolCall(session, "run_command", { CommandLine: "curl localhost" });
-      const r3Mutating = tracker.recordToolCall(session, "run_command", {
+      // run_command is mutating -> default threshold 10 without polling intent
+      for (let i = 1; i <= 9; i++) {
+        expect(
+          tracker.recordToolCall(session, "run_command", { CommandLine: "curl localhost" }).isLoop,
+        ).toBe(false);
+      }
+      const r10Mutating = tracker.recordToolCall(session, "run_command", {
         CommandLine: "curl localhost",
       });
-      expect(r3Mutating.isLoop).toBe(false);
+      expect(r10Mutating.isLoop).toBe(true);
+    });
 
-      tracker.recordToolCall(session, "run_command", { CommandLine: "curl localhost" });
-      const r5Mutating = tracker.recordToolCall(session, "run_command", {
-        CommandLine: "curl localhost",
-      });
-      expect(r5Mutating.isLoop).toBe(true);
+    it("resets resource inspection tracking when a mutating tool is executed", () => {
+      const tracker = new RepetitiveToolLoopTracker();
+      const session = "s-mutating-reset";
+
+      // Read different slices of the same file 10 times
+      for (let i = 0; i < 10; i++) {
+        const res = tracker.recordToolCall(session, "view_file", {
+          AbsolutePath: "/src/main.ts",
+          StartLine: i * 10,
+          EndLine: i * 10 + 10,
+        });
+        expect(res.isLoop).toBe(false);
+      }
+
+      // Mutating command runs (e.g. edit or test command)
+      tracker.recordToolCall(session, "run_command", { CommandLine: "bazel test //..." });
+
+      // Reads continue: should NOT trigger because the mutating tool reset resource signatures!
+      for (let i = 10; i < 20; i++) {
+        const res = tracker.recordToolCall(session, "view_file", {
+          AbsolutePath: "/src/main.ts",
+          StartLine: i * 10,
+          EndLine: i * 10 + 10,
+        });
+        expect(res.isLoop).toBe(false);
+      }
     });
 
     it("allows polling repetitions when prompt contains polling intent", () => {
@@ -251,7 +277,7 @@ describe("repetitive-tool-loop unit tests", () => {
 
   describe("createRepetitiveToolLoopFix hook", () => {
     it("intercepts repetitive tool call, completes tool, sends cancel, and delivers automated steering without polluting chat", async () => {
-      const fix = createRepetitiveToolLoopFix();
+      const fix = createRepetitiveToolLoopFix({ cycleThreshold: 3 });
       const context = createMockContext();
       const writtenToChild: AcpStreamMessage[] = [];
       const forwardedInbound: AcpStreamMessage[] = [];
@@ -376,7 +402,7 @@ describe("repetitive-tool-loop unit tests", () => {
     });
 
     it("detects file inspection loops on the same file even when line numbers shift", async () => {
-      const fix = createRepetitiveToolLoopFix();
+      const fix = createRepetitiveToolLoopFix({ readOnlySingleThreshold: 3 });
       const context = createMockContext();
       const writtenToChild: AcpStreamMessage[] = [];
 
@@ -431,6 +457,96 @@ describe("repetitive-tool-loop unit tests", () => {
         method: ACP_METHODS.SESSION_CANCEL,
         params: { sessionId },
       });
+    });
+
+    it("settles in-flight steer prompt as cancelled with original prompt ID when client interrupts during steering", async () => {
+      const fix = createRepetitiveToolLoopFix({ readOnlySingleThreshold: 3 });
+      const context = createMockContext();
+      const writtenToChild: AcpStreamMessage[] = [];
+
+      context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+        writtenToChild.push(msg);
+      });
+
+      const sessionId = "s-steer-cancel-test";
+      const originalPromptId = 42;
+
+      // 1. Client starts turn 42
+      await fix.onOutbound?.(
+        {
+          jsonrpc: "2.0",
+          id: originalPromptId,
+          method: ACP_METHODS.SESSION_PROMPT,
+          params: { sessionId, prompt: [{ type: "text", text: "Look at logs" }] },
+        } as unknown as AcpStreamMessage,
+        context,
+      );
+
+      const makeToolCall = (id: string): AcpStreamMessage => ({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: id,
+            title: "Running view_file",
+            rawInput: { AbsolutePath: "/var/log/app.log", StartLine: 1, EndLine: 100 },
+          },
+        },
+      });
+
+      // 2. Repetitive calls trigger loop detection
+      await fix.onInbound?.(makeToolCall("t1"), context);
+      await fix.onInbound?.(makeToolCall("t2"), context);
+      const loopRes = await fix.onInbound?.(makeToolCall("t3"), context);
+      expect(loopRes).toEqual([]);
+
+      // 3. Upstream settles the cancelled original prompt 42
+      const upstreamCancelMsg: AcpStreamMessage = {
+        jsonrpc: "2.0",
+        id: originalPromptId,
+        result: { stopReason: STOP_REASONS.CANCELLED },
+      };
+      const steerSuppress = await fix.onInbound?.(upstreamCancelMsg, context);
+      expect(steerSuppress).toEqual([]);
+
+      // Automated steering prompt was dispatched
+      const steerMsg = writtenToChild.find(
+        (m) =>
+          "method" in m &&
+          m.method === ACP_METHODS.SESSION_PROMPT &&
+          String((m as { id: unknown }).id).startsWith("steer_"),
+      );
+      expect(steerMsg).toBeDefined();
+      const steerPromptId = (steerMsg as unknown as { id: string }).id;
+
+      // 4. Now user interrupts: Paseo sends outbound session/cancel
+      await fix.onOutbound?.(
+        {
+          jsonrpc: "2.0",
+          method: ACP_METHODS.SESSION_CANCEL,
+          params: { sessionId },
+        } as unknown as AcpStreamMessage,
+        context,
+      );
+
+      // 5. Upstream responds to steerPromptId with cancelled
+      const upstreamSteerCancel: AcpStreamMessage = {
+        jsonrpc: "2.0",
+        id: steerPromptId,
+        result: { stopReason: STOP_REASONS.CANCELLED },
+      };
+      const finalInbound = await fix.onInbound?.(upstreamSteerCancel, context);
+
+      // Must be mapped back to originalPromptId 42, NOT steerPromptId!
+      expect(finalInbound).toEqual([
+        {
+          jsonrpc: "2.0",
+          id: originalPromptId,
+          result: { stopReason: STOP_REASONS.CANCELLED },
+        },
+      ]);
     });
   });
 });
