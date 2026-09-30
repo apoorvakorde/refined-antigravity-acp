@@ -7,9 +7,12 @@ import {
 } from "../../core/types.js";
 import { createMockContext } from "../../test-utils/e2e-harness.js";
 import {
+  buildSteeringText,
   canonicalizeValue,
   computeToolCallSignature,
   createRepetitiveToolLoopFix,
+  DEFAULT_READ_ONLY_SINGLE_THRESHOLD,
+  DEFAULT_RESOURCE_LOOP_THRESHOLD,
   detectCycle,
   extractPromptText,
   extractRequestedIterations,
@@ -181,16 +184,16 @@ describe("repetitive-tool-loop unit tests", () => {
   });
 
   describe("RepetitiveToolLoopTracker", () => {
-    it("uses conservative single threshold for mutating tools and lower threshold for read-only tools", () => {
+    it("uses conservative single threshold for mutating tools and relaxed threshold for read-only tools", () => {
       const tracker = new RepetitiveToolLoopTracker();
       const session = "s1";
 
-      // view_file is read-only -> threshold 6
-      for (let i = 1; i <= 5; i++) {
+      // view_file is read-only -> threshold 15
+      for (let i = 1; i <= 14; i++) {
         expect(tracker.recordToolCall(session, "view_file", { path: "f1" }).isLoop).toBe(false);
       }
-      const r6 = tracker.recordToolCall(session, "view_file", { path: "f1" });
-      expect(r6.isLoop).toBe(true);
+      const r15 = tracker.recordToolCall(session, "view_file", { path: "f1" });
+      expect(r15.isLoop).toBe(true);
 
       tracker.startTurn(session);
       // run_command is mutating -> default threshold 10 without polling intent
@@ -547,6 +550,49 @@ describe("repetitive-tool-loop unit tests", () => {
           result: { stopReason: STOP_REASONS.CANCELLED },
         },
       ]);
+    });
+  });
+
+  describe("thresholds and minimal steering", () => {
+    it("exports relaxed thresholds for read-only tools and resource loops", () => {
+      expect(DEFAULT_READ_ONLY_SINGLE_THRESHOLD).toBe(15);
+      expect(DEFAULT_RESOURCE_LOOP_THRESHOLD).toBe(25);
+    });
+
+    it("generates minimal, neutral steering on initial loop detection without commanding premature stops or blocking reads", () => {
+      const text = buildSteeringText("view_file", "/app/compose.py", 15, 0);
+
+      // Matches proxy internal prompt filter
+      expect(text).toMatch(/^\[Automated Steering\]:/);
+      expect(text).toContain("view_file");
+      expect(text).toContain("/app/compose.py");
+      expect(text).toContain("Repetition was halted");
+      expect(text).toContain("continue with the next step of your task");
+
+      // Critical: must NOT order the model to stop, summarize, report to the user, or forbid tool calls
+      expect(text).not.toContain("report your status");
+      expect(text).not.toContain("to the user");
+      expect(text).not.toContain("summarize");
+      expect(text).not.toContain("Do not re-read");
+      expect(text).not.toContain("replace_file_content");
+      expect(text).not.toContain("run_command");
+    });
+
+    it("generates minimal steering on repeated loops without commanding the model to report status and halt", () => {
+      const text = buildSteeringText("view_file", "/app/compose.py", 15, 1);
+
+      // Matches proxy internal prompt filter
+      expect(text).toMatch(/^\[Automated Steering\]:/);
+      expect(text).toContain("view_file");
+      expect(text).toContain("Repetition was halted again");
+      expect(text).toContain("proceed with a different action to advance your task");
+
+      // Critical: previous implementation had:
+      // "Summarize what you have accomplished so far, explain what is blocking you or what you found, and report your status to the user immediately."
+      // This caused the model to emit a summary, stop calling tools, and trigger stopReason: end_turn, abandoning tasks!
+      expect(text).not.toContain("report your status");
+      expect(text).not.toContain("to the user immediately");
+      expect(text).not.toContain("summarize what you have accomplished");
     });
   });
 });

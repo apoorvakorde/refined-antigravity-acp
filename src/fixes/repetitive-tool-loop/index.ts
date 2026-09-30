@@ -248,10 +248,10 @@ interface SessionTurnState {
   lastTargetResource?: string | undefined;
 }
 
-export const DEFAULT_READ_ONLY_SINGLE_THRESHOLD = 6;
+export const DEFAULT_READ_ONLY_SINGLE_THRESHOLD = 15;
 export const DEFAULT_MUTATING_SINGLE_THRESHOLD = 10;
 export const DEFAULT_CYCLE_THRESHOLD = 4;
-export const DEFAULT_RESOURCE_LOOP_THRESHOLD = 15;
+export const DEFAULT_RESOURCE_LOOP_THRESHOLD = 25;
 
 function resolveSingleThreshold(
   isReadOnly: boolean,
@@ -549,23 +549,17 @@ export function buildSteeringText(
   repetitions: number,
   steerCount: number,
 ): string {
+  const targetDesc = targetResource ? ` on '${targetResource}'` : "";
   if (steerCount > 0) {
     return (
-      `[Automated Steering]: You are still repeatedly executing '${toolName}'. Repetition is halted. ` +
-      `Summarize what you have accomplished so far, explain what is blocking you or what you found, and report your status to the user immediately.`
+      `[Automated Steering]: You are still repeatedly executing '${toolName}'${targetDesc}. Repetition was halted again. ` +
+      `Please proceed with a different action to advance your task.`
     );
   }
-  if (READ_ONLY_TOOLS.has(toolName)) {
-    const targetDesc = targetResource ? ` on '${targetResource}'` : "";
-    return (
-      `[Automated Steering]: You have repeatedly executed '${toolName}'${targetDesc} without making progress. ` +
-      `Do not re-read or inspect this file again. You already have the code context you need. ` +
-      `Analyze your findings, decide on the required code modifications or commands, and proceed immediately with making changes to bring the task to completion.`
-    );
-  }
+  const countDesc = repetitions > 1 ? ` (${repetitions} times)` : "";
   return (
-    `[Automated Steering]: You have repeatedly executed '${toolName}' (${repetitions} times) without progress. ` +
-    `Stop repeating this action. Evaluate your current results, decide on the required next steps or changes, and proceed immediately to complete the user's task.`
+    `[Automated Steering]: You have repeatedly executed '${toolName}'${targetDesc}${countDesc}. Repetition was halted. ` +
+    `Please evaluate the information gathered so far and continue with the next step of your task.`
   );
 }
 

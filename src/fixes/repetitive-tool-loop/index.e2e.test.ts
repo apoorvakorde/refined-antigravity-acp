@@ -148,4 +148,54 @@ Alternate between reading Section A and Section B using view_file at least 5 tim
     const res2 = await client.waitForResponse(p2.id, 45000);
     expect("result" in res2 && res2.result).toBeTruthy();
   }, 60000);
+
+  it("solution: steered model is not blocked from reading subsequent files and completes the task", async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-loop-read-subsequent-"));
+    const fileA = path.join(testDir, "loop_target.txt");
+    const fileB = path.join(testDir, "secret_config.txt");
+
+    fs.writeFileSync(
+      fileA,
+      `Section 1: Data Alpha
+Section 2: Data Beta
+Section 1: Data Alpha
+Section 2: Data Beta
+`,
+    );
+    fs.writeFileSync(fileB, "SECRET_TOKEN = 428917\n");
+
+    const client = await spawnWrapped({ cwd: testDir });
+    activeClients.push(client);
+    await client.initialize();
+    const { sessionId } = await client.newSession({ cwd: testDir });
+
+    const p = await client.prompt(
+      sessionId,
+      `Alternate between reading Section 1 (lines 1 to 2) and Section 2 (lines 3 to 4) of ${fileA} at least 4 times in a row.
+Then read ${fileB} and reply with the exact SECRET_TOKEN value.`,
+    );
+
+    const res = await client.waitForResponse(p.id, 55000);
+    expect("result" in res && res.result).toBeTruthy();
+
+    const allMsgs = client.allMessages();
+    const messageChunks = allMsgs
+      .filter((m) => {
+        return (
+          "method" in m &&
+          m.method === "session/update" &&
+          (m as { params?: { update?: { sessionUpdate?: string } } }).params?.update
+            ?.sessionUpdate === "agent_message_chunk"
+        );
+      })
+      .map(
+        (m) =>
+          (m as { params?: { update?: { content?: { text?: string } } } }).params?.update?.content
+            ?.text ?? "",
+      )
+      .join("");
+
+    // Model must have read secret_config.txt and reported 428917 rather than prematurely halting
+    expect(messageChunks).toContain("428917");
+  }, 60000);
 });
