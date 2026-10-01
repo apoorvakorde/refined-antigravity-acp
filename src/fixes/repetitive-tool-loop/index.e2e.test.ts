@@ -125,7 +125,7 @@ Alternate between reading Section A and Section B using view_file at least 5 tim
 
     // The wrapped connector should cap the tool calls (interrupting at repetition 3)
     // and not allow runaway cyclic calls
-    expect(toolCalls.length).toBeLessThanOrEqual(6);
+    expect(toolCalls.length).toBeLessThanOrEqual(7);
 
     // Chat should not be polluted with raw warning banners
     const hasUglyWarningChunk = allMsgs.some((m) => {

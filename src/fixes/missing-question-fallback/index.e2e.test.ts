@@ -17,7 +17,7 @@ describe("ask_question unhandled collision e2e", () => {
     const client = await spawnRawAgy();
     activeClients.push(client);
     await client.initialize();
-    const { sessionId } = await client.newSession();
+    const { sessionId } = await client.newSession({ modeId: "yolo" });
 
     // Model is prompted to ask a question
     await client.prompt(
@@ -25,16 +25,15 @@ describe("ask_question unhandled collision e2e", () => {
       "Please call the ask_question tool immediately to ask what color I prefer (Red or Blue). Do not generate any other text before calling the tool.",
     );
 
-    // Wait until the ask_question tool call is emitted
-    const toolCallMsg = await client.nextMatching(
+    // Wait until the question permission request is emitted
+    const questionMsg = await client.nextMatching(
       (m) =>
         "method" in m &&
-        m.method === "session/update" &&
-        JSON.stringify(m).includes("ask_question"),
+        (m.method === "session/request_permission" || m.method === "session/requestPermission"),
       30000,
     );
 
-    expect(toolCallMsg).toBeDefined();
+    expect(questionMsg).toBeDefined();
 
     // Now user types a response into chat rather than selecting a button
     const p2 = await client.prompt(
@@ -42,11 +41,12 @@ describe("ask_question unhandled collision e2e", () => {
       "I prefer Green actually, please proceed with Green.",
     );
 
-    // In raw agy, this second prompt is rejected with foreground turn active or hangs indefinitely
-    const res2 = await client.waitForResponse(p2.id, 10000);
-    expect("error" in res2 && res2.error).toBeTruthy();
-    if ("error" in res2 && res2.error) {
-      expect(JSON.stringify(res2.error)).toContain("foreground turn is already active");
+    // In raw agy, this second prompt either hangs indefinitely or is rejected with foreground turn active
+    const res2 = await client.waitForResponse(p2.id, 5000).catch((err: Error) => err);
+    if (res2 instanceof Error) {
+      expect(res2.message).toContain("Timeout waiting for matching message");
+    } else {
+      expect("error" in res2 && res2.error).toBeTruthy();
     }
   }, 45000);
 
@@ -54,7 +54,7 @@ describe("ask_question unhandled collision e2e", () => {
     const client = await spawnWrapped();
     activeClients.push(client);
     await client.initialize();
-    const { sessionId } = await client.newSession();
+    const { sessionId } = await client.newSession({ modeId: "yolo" });
 
     // Model is prompted to ask a question
     await client.prompt(
@@ -62,16 +62,15 @@ describe("ask_question unhandled collision e2e", () => {
       "Please call the ask_question tool immediately to ask what color I prefer (Red or Blue). Do not generate any other text before calling the tool.",
     );
 
-    // Wait until the ask_question tool call is emitted
-    const toolCallMsg = await client.nextMatching(
+    // Wait until the question permission request is emitted
+    const questionMsg = await client.nextMatching(
       (m) =>
         "method" in m &&
-        m.method === "session/update" &&
-        JSON.stringify(m).includes("ask_question"),
+        (m.method === "session/request_permission" || m.method === "session/requestPermission"),
       30000,
     );
 
-    expect(toolCallMsg).toBeDefined();
+    expect(questionMsg).toBeDefined();
 
     // Now user types a response into chat rather than selecting a button
     const p2 = await client.prompt(

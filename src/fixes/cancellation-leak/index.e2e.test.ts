@@ -104,11 +104,20 @@ describe("cancellation-leak e2e", () => {
     const client = await spawnWrapped();
     activeClients.push(client);
     await client.initialize();
-    const { sessionId } = await client.newSession();
+    const { sessionId } = await client.newSession({ modeId: "yolo" });
 
-    const p1 = await client.prompt(sessionId, "Count from 1 to 100 with pauses between numbers");
+    const p1 = await client.prompt(
+      sessionId,
+      "Do not use any tools. Count from 1 to 100 with pauses between numbers.",
+    );
 
-    await client.nextMatching((m) => "method" in m && m.method === "session/update");
+    await client.nextMatching(
+      (m) =>
+        "method" in m &&
+        m.method === "session/update" &&
+        (m as { params?: { update?: { sessionUpdate?: string } } }).params?.update
+          ?.sessionUpdate === "agent_message_chunk",
+    );
 
     const t0 = Date.now();
     await client.send({

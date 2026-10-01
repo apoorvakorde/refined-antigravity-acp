@@ -12,7 +12,7 @@ describe("missing-usage-metrics e2e", () => {
     }
   });
 
-  it("problem: raw agy binary never emits usage_update on session/prompt", async () => {
+  it("verified: raw agy binary natively emits usage_update in ACP >= 1.3.0", async () => {
     const rawClient = await spawnRawAgy();
     activeClients.push(rawClient);
 
@@ -30,10 +30,20 @@ describe("missing-usage-metrics e2e", () => {
           (m.params as SessionUpdateParams | undefined)?.update?.sessionUpdate === "usage_update",
       );
 
-    expect(usageUpdates).toHaveLength(0);
+    // Upstream 1.3.0 natively emits ACP usage_update
+    expect(usageUpdates.length).toBeGreaterThan(0);
+    const update = (usageUpdates[0] as unknown as { params?: SessionUpdateParams }).params
+      ?.update as {
+      used?: unknown;
+      size?: unknown;
+    };
+    expect(typeof update.used).toBe("number");
+    expect(Number(update.used)).toBeGreaterThan(0);
+    expect(typeof update.size).toBe("number");
+    expect(Number(update.size)).toBeGreaterThanOrEqual(1000000);
   });
 
-  it("solution: wrapped connector synthesizes usage_update with token metrics", async () => {
+  it("solution: wrapped connector cleanly passes through native usage_update without duplication", async () => {
     const wrappedClient = await spawnWrapped();
     activeClients.push(wrappedClient);
 
@@ -51,7 +61,8 @@ describe("missing-usage-metrics e2e", () => {
           (m.params as SessionUpdateParams | undefined)?.update?.sessionUpdate === "usage_update",
       );
 
-    expect(usageUpdates.length).toBeGreaterThan(0);
+    // Since the patch is retired from default fixes, exactly 1 native usage_update passes through
+    expect(usageUpdates).toHaveLength(1);
     const update = (usageUpdates[0] as unknown as { params?: SessionUpdateParams }).params
       ?.update as {
       used?: unknown;
