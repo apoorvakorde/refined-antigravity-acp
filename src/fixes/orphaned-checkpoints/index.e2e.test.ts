@@ -219,4 +219,110 @@ describe("orphaned-checkpoints e2e", () => {
       fs.rmSync(db2, { force: true });
     });
   });
+
+  describe("Out-of-Bounds Metadata Pruning", () => {
+    it("problem: orphaned metadata with step indices beyond max steps remains in database", () => {
+      const geminiHome = process.env.GEMINI_HOME || path.join(os.homedir(), ".gemini");
+      const convDir = path.join(geminiHome, "antigravity-acp", "conversations");
+      fs.mkdirSync(convDir, { recursive: true });
+
+      const sess = "e2e-oob-raw-" + Date.now();
+      const dbPath = path.join(convDir, sess + ".db");
+
+      const d = new DatabaseSync(dbPath);
+      d.exec(
+        "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, status INTEGER, step_type INTEGER, step_payload BLOB);",
+      );
+      d.exec("CREATE TABLE IF NOT EXISTS executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+      d.exec("CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+
+      // Valid step up to idx 10
+      d.prepare(
+        "INSERT INTO steps (idx, status, step_type, step_payload) VALUES (10, 3, 15, NULL);",
+      ).run();
+
+      // Orphaned executor_metadata referencing step 999
+      const execData = Buffer.concat([Buffer.from([0x18]), Buffer.from([0xe7, 0x07])]); // tag 24 (field 3), val 999
+      d.prepare("INSERT INTO executor_metadata (idx, data) VALUES (1, ?);").run(execData);
+
+      // Orphaned gen_metadata referencing step 999
+      const genData = encodeLengthDelimited(2, Buffer.from([0xe7, 0x07, 0x00])); // field 2: [999, 0]
+      d.prepare("INSERT INTO gen_metadata (idx, data) VALUES (1, ?);").run(genData);
+      d.close();
+
+      const rawDb = new DatabaseSync(dbPath, { readOnly: true });
+      const execCount = (
+        rawDb.prepare("SELECT count(*) as c FROM executor_metadata;").get() as { c: number }
+      ).c;
+      const genCount = (
+        rawDb.prepare("SELECT count(*) as c FROM gen_metadata;").get() as { c: number }
+      ).c;
+      rawDb.close();
+
+      expect(execCount).toBe(1);
+      expect(genCount).toBe(1);
+
+      fs.rmSync(dbPath, { force: true });
+    });
+
+    it("solution: repairOrphanedCheckpoints automatically prunes out-of-bounds executor_metadata and gen_metadata", () => {
+      const geminiHome = process.env.GEMINI_HOME || path.join(os.homedir(), ".gemini");
+      const convDir = path.join(geminiHome, "antigravity-acp", "conversations");
+      fs.mkdirSync(convDir, { recursive: true });
+
+      const sess = "e2e-oob-fix-" + Date.now();
+      const dbPath = path.join(convDir, sess + ".db");
+
+      const d = new DatabaseSync(dbPath);
+      d.exec(
+        "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, status INTEGER, step_type INTEGER, step_payload BLOB);",
+      );
+      d.exec("CREATE TABLE IF NOT EXISTS executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+      d.exec("CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);");
+
+      // Valid steps up to idx 10, plus a trailing error step at idx 11
+      d.prepare(
+        "INSERT INTO steps (idx, status, step_type, step_payload) VALUES (10, 3, 15, NULL);",
+      ).run();
+      d.prepare(
+        "INSERT INTO steps (idx, status, step_type, step_payload) VALUES (11, 3, 17, NULL);",
+      ).run();
+
+      // Valid executor_metadata referencing step 10
+      const validExec = Buffer.concat([Buffer.from([0x18]), Buffer.from([0x0a])]); // tag 24, val 10
+      d.prepare("INSERT INTO executor_metadata (idx, data) VALUES (1, ?);").run(validExec);
+      // Orphaned executor_metadata referencing step 999
+      const oobExec = Buffer.concat([Buffer.from([0x18]), Buffer.from([0xe7, 0x07])]); // tag 24, val 999
+      d.prepare("INSERT INTO executor_metadata (idx, data) VALUES (2, ?);").run(oobExec);
+
+      // Valid gen_metadata referencing step 10
+      const validGen = encodeLengthDelimited(2, Buffer.from([0x0a, 0x00])); // field 2: [10, 0]
+      d.prepare("INSERT INTO gen_metadata (idx, data) VALUES (1, ?);").run(validGen);
+      // Orphaned gen_metadata referencing step 999
+      const oobGen = encodeLengthDelimited(2, Buffer.from([0xe7, 0x07, 0x00])); // field 2: [999, 0]
+      d.prepare("INSERT INTO gen_metadata (idx, data) VALUES (2, ?);").run(oobGen);
+      d.close();
+
+      const repaired = repairOrphanedCheckpoints(sess);
+      expect(repaired).toBeGreaterThanOrEqual(3); // 1 error step + 1 oob exec + 1 oob gen
+
+      const checkDb = new DatabaseSync(dbPath, { readOnly: true });
+      const execRows = checkDb.prepare("SELECT idx FROM executor_metadata;").all() as Array<{
+        idx: number;
+      }>;
+      const genRows = checkDb.prepare("SELECT idx FROM gen_metadata;").all() as Array<{
+        idx: number;
+      }>;
+      const stepRows = checkDb
+        .prepare("SELECT idx FROM steps WHERE step_type = 17;")
+        .all() as Array<{ idx: number }>;
+      checkDb.close();
+
+      expect(execRows).toEqual([{ idx: 1 }]);
+      expect(genRows).toEqual([{ idx: 1 }]);
+      expect(stepRows).toHaveLength(0);
+
+      fs.rmSync(dbPath, { force: true });
+    });
+  });
 });
