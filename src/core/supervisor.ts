@@ -3,6 +3,7 @@ import readline from "node:readline";
 import {
   ACP_METHODS,
   STOP_REASONS,
+  SESSION_UPDATES,
   RECYCLE_ID_PREFIX,
   RECYCLE_INIT_ID,
   RECYCLE_LOAD_ID,
@@ -15,6 +16,7 @@ import {
   type OutboundContext,
   type StderrContext,
   type SessionCache,
+  type SessionUpdateParams,
   type UrlRewriter,
   isJsonRpcResponse,
 } from "./types.js";
@@ -44,6 +46,7 @@ export {
 const DEFAULT_RECYCLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
 const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
+const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 1000;
 
 function parseEnvMs(val: string | undefined, defaultMs: number): number {
   if (!val) return defaultMs;
@@ -62,6 +65,12 @@ function extractModeId(modeId?: string, meta?: unknown): string | undefined {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isUsageUpdate(msg: AcpStreamMessage): boolean {
+  if (!("method" in msg) || msg.method !== ACP_METHODS.SESSION_UPDATE) return false;
+  const update = (msg.params as SessionUpdateParams | undefined)?.update;
+  return update?.sessionUpdate === SESSION_UPDATES.USAGE_UPDATE;
 }
 
 interface PendingInternalRequest {
@@ -85,6 +94,8 @@ export interface SupervisorOptions {
   recycleSpawnAttempts?: number | undefined;
   /** Delay between failed respawn attempts. */
   recycleRetryDelayMs?: number | undefined;
+  /** Watchdog timeout in ms to synthesize terminal prompt response when upstream hangs after usage_update. */
+  promptSettlementTimeoutMs?: number | undefined;
 }
 
 export class ProcessSupervisor implements CoreContext {
@@ -101,6 +112,9 @@ export class ProcessSupervisor implements CoreContext {
   private readonly recycleTimeoutMs: number;
   private readonly recycleSpawnAttempts: number;
   private readonly recycleRetryDelayMs: number;
+  private readonly promptSettlementTimeoutMs: number;
+  private readonly promptSettlementTimers = new Map<string, NodeJS.Timeout>();
+  private readonly activePrompts = new Map<string, string | number>();
   private readonly pendingRequests = new Map<string | number, PendingInternalRequest>();
   private readonly suppressedResponseIds = new Set<string | number>();
   private activeRecycle: Promise<void> | null = null;
@@ -124,6 +138,12 @@ export class ProcessSupervisor implements CoreContext {
       parseEnvMs(process.env.REFINED_AGY_RECYCLE_TIMEOUT_MS, DEFAULT_RECYCLE_TIMEOUT_MS);
     this.recycleSpawnAttempts = options.recycleSpawnAttempts ?? DEFAULT_RECYCLE_SPAWN_ATTEMPTS;
     this.recycleRetryDelayMs = options.recycleRetryDelayMs ?? DEFAULT_RECYCLE_RETRY_DELAY_MS;
+    this.promptSettlementTimeoutMs =
+      options.promptSettlementTimeoutMs ??
+      parseEnvMs(
+        process.env.REFINED_AGY_PROMPT_SETTLE_TIMEOUT_MS,
+        DEFAULT_PROMPT_SETTLE_TIMEOUT_MS,
+      );
 
     this.baseContext = {
       sessionCache: this.sessionCache,
@@ -183,6 +203,68 @@ export class ProcessSupervisor implements CoreContext {
     } as unknown as AcpStreamMessage;
 
     this.forwardInbound(syntheticMsg);
+  }
+
+  private clearPromptSettlementTimer(sessionId: string): void {
+    const timer = this.promptSettlementTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.promptSettlementTimers.delete(sessionId);
+    }
+  }
+
+  private clearAllPromptSettlementTimers(): void {
+    for (const timer of this.promptSettlementTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.promptSettlementTimers.clear();
+    this.activePrompts.clear();
+  }
+
+  private armPromptSettlementWatchdog(sessionId: string): void {
+    if (this.promptSettlementTimeoutMs <= 0) return;
+    const promptId = this.activePrompts.get(sessionId);
+    if (promptId === undefined) return;
+
+    this.clearPromptSettlementTimer(sessionId);
+
+    const timer = setTimeout(() => {
+      this.promptSettlementTimers.delete(sessionId);
+      this.settleHungPrompt(sessionId, promptId);
+    }, this.promptSettlementTimeoutMs);
+
+    this.promptSettlementTimers.set(sessionId, timer);
+  }
+
+  private settleHungPrompt(sessionId: string, promptId: string | number): void {
+    const currentActivePromptId = this.activePrompts.get(sessionId);
+    if (currentActivePromptId !== promptId) return;
+
+    this.activePrompts.delete(sessionId);
+    if (this.suppressedResponseIds.size >= 1000) {
+      const oldest = this.suppressedResponseIds.keys().next().value;
+      if (oldest !== undefined) this.suppressedResponseIds.delete(oldest);
+    }
+    this.suppressedResponseIds.add(promptId);
+
+    console.error(
+      `[refined-antigravity-acp] Prompt ${promptId} for session ${sessionId} settled via timeout after usage_update`,
+    );
+
+    const syntheticMsg = {
+      jsonrpc: "2.0",
+      id: promptId,
+      result: { stopReason: STOP_REASONS.END_TURN },
+    } as unknown as AcpStreamMessage;
+
+    this.forwardInbound(syntheticMsg);
+
+    const session = getSession(this.sessionCache, sessionId);
+    const context = this.createContext(session);
+    const turnEndMessages = this.pipeline.applyTurnEnd(sessionId, context);
+    for (const m of turnEndMessages) {
+      this.forwardInbound(m);
+    }
   }
 
   async triggerRecycle(session: CachedSessionMetadata): Promise<void> {
@@ -343,32 +425,44 @@ export class ProcessSupervisor implements CoreContext {
     if (!isClose && !isDelete) return;
     const p = (msg as { params?: { sessionId?: string } }).params;
     if (p?.sessionId) {
+      this.clearPromptSettlementTimer(p.sessionId);
+      this.activePrompts.delete(p.sessionId);
       this.sessionCache.sessions.delete(p.sessionId);
+    }
+  }
+
+  private recordOutboundPrompt(msg: AcpStreamMessage): void {
+    const p = msg as { id?: string | number; params?: { sessionId?: string } };
+    if (p.id !== undefined && p.params?.sessionId) {
+      this.clearPromptSettlementTimer(p.params.sessionId);
+      this.activePrompts.set(p.params.sessionId, p.id);
+    }
+  }
+
+  private recordOutboundCancel(msg: AcpStreamMessage): void {
+    const p = (msg as { params?: { sessionId?: string } }).params;
+    if (p?.sessionId) {
+      this.clearPromptSettlementTimer(p.sessionId);
+      this.activePrompts.delete(p.sessionId);
     }
   }
 
   private recordOutboundMetadata(msg: AcpStreamMessage): void {
     if (!("method" in msg)) return;
-    switch (msg.method) {
-      case ACP_METHODS.INITIALIZE:
-        this.sessionCache.cachedInitializeParams = (msg as { params?: unknown }).params;
-        break;
-      case ACP_METHODS.SESSION_NEW:
-        this.recordOutboundSessionNew(msg);
-        break;
-      case ACP_METHODS.SESSION_LOAD:
-        this.recordOutboundSessionLoad(msg);
-        break;
-      case ACP_METHODS.SESSION_SET_MODE:
-        this.recordOutboundSetMode(msg);
-        break;
-      case ACP_METHODS.SESSION_SET_CONFIG_OPTION:
-        this.recordOutboundSetConfigOption(msg);
-        break;
-      default:
-        this.handleSessionLifecycleMetadata(msg);
-        break;
-    }
+    const handlers: Record<string, (m: AcpStreamMessage) => void> = {
+      [ACP_METHODS.INITIALIZE]: (m) => {
+        this.sessionCache.cachedInitializeParams = (m as { params?: unknown }).params;
+      },
+      [ACP_METHODS.SESSION_NEW]: (m) => this.recordOutboundSessionNew(m),
+      [ACP_METHODS.SESSION_LOAD]: (m) => this.recordOutboundSessionLoad(m),
+      [ACP_METHODS.SESSION_PROMPT]: (m) => this.recordOutboundPrompt(m),
+      [ACP_METHODS.SESSION_CANCEL]: (m) => this.recordOutboundCancel(m),
+      [ACP_METHODS.SESSION_SET_MODE]: (m) => this.recordOutboundSetMode(m),
+      [ACP_METHODS.SESSION_SET_CONFIG_OPTION]: (m) => this.recordOutboundSetConfigOption(m),
+      [ACP_METHODS.SESSION_CLOSE]: (m) => this.handleSessionLifecycleMetadata(m),
+      [ACP_METHODS.SESSION_DELETE]: (m) => this.handleSessionLifecycleMetadata(m),
+    };
+    handlers[msg.method]?.(msg);
   }
 
   private trackPendingRequestSession(msg: AcpStreamMessage, sessionId?: string): void {
@@ -418,12 +512,37 @@ export class ProcessSupervisor implements CoreContext {
     }
   }
 
+  private clearActivePromptByMsg(msg: AcpStreamMessage): void {
+    if (!("id" in msg) || msg.id === null || msg.id === undefined) return;
+    const msgId = msg.id;
+    for (const [sId, pId] of this.activePrompts.entries()) {
+      if (pId === msgId) {
+        this.clearPromptSettlementTimer(sId);
+        this.activePrompts.delete(sId);
+      }
+    }
+  }
+
+  private handleInboundPromptSettlement(
+    msg: AcpStreamMessage,
+    sessionId: string | undefined,
+  ): void {
+    if (sessionId && isUsageUpdate(msg)) {
+      this.armPromptSettlementWatchdog(sessionId);
+    }
+    if ("result" in msg || "error" in msg) {
+      this.clearActivePromptByMsg(msg);
+    }
+  }
+
   private async dispatchInboundPipeline(
     msg: AcpStreamMessage,
     sessionId: string | undefined,
     context: InboundContext,
   ): Promise<void> {
     try {
+      this.handleInboundPromptSettlement(msg, sessionId);
+
       const messages = await this.pipeline.applyInbound(msg, context);
       for (const m of messages) this.forwardInbound(m);
 
@@ -450,6 +569,7 @@ export class ProcessSupervisor implements CoreContext {
     }
     traceAcp("agy->client", msg);
     if (this.tryHandleInternalRecycle(msg) || this.tryHandleSuppressedResponse(msg)) return;
+    if (this.isRecycling) return;
 
     const responseSessionId = resolveResponseSession(msg, this.sessionCache);
     const sessionId = responseSessionId ?? extractSessionId(msg);
@@ -513,6 +633,7 @@ export class ProcessSupervisor implements CoreContext {
     this.pipeline.dispose();
     this.rlErr?.close();
     this.rlOut?.close();
+    this.clearAllPromptSettlementTimers();
     this.rejectPendingRequests(err);
     this.closeController(err);
   }
@@ -613,6 +734,7 @@ export class ProcessSupervisor implements CoreContext {
     }
     this.suppressedResponseIds.clear();
     clearPendingRequestSessions(this.sessionCache);
+    this.clearAllPromptSettlementTimers();
   }
 
   async recycleProcess(session: CachedSessionMetadata): Promise<void> {
@@ -688,6 +810,7 @@ export class ProcessSupervisor implements CoreContext {
     if (!this.currentChild.killed) {
       this.currentChild.kill("SIGTERM");
     }
+    this.clearAllPromptSettlementTimers();
     this.rejectPendingRequests(new Error("Supervisor closed"));
     this.closeController();
   }
@@ -702,6 +825,7 @@ export class ProcessSupervisor implements CoreContext {
     if (!this.currentChild.killed) {
       this.currentChild.kill("SIGKILL");
     }
+    this.clearAllPromptSettlementTimers();
     this.rejectPendingRequests(new Error("Supervisor aborted"));
     this.closeController();
   }
