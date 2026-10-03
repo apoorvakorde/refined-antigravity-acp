@@ -1,6 +1,45 @@
 import { describe, expect, it } from "vitest";
-import type { AcpStreamMessage, StderrContext } from "../../core/types.js";
+import { PassThrough } from "node:stream";
+import type { ChildProcess } from "node:child_process";
+import {
+  ACP_METHODS,
+  SESSION_UPDATES,
+  type AcpFix,
+  type AcpStreamMessage,
+  type StderrContext,
+} from "../../core/types.js";
+import { AcpPipeline } from "../../core/pipeline.js";
+import { ProcessSupervisor } from "../../core/supervisor.js";
 import { createBackgroundTasksFix } from "./index.js";
+
+function createMockChild(): {
+  child: ChildProcess;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  stdin: PassThrough;
+} {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const stdin = new PassThrough();
+
+  let isKilled = false;
+  const child = {
+    stdout,
+    stderr,
+    stdin,
+    get killed() {
+      return isKilled;
+    },
+    on: () => child,
+    once: () => child,
+    kill: () => {
+      isKilled = true;
+      return true;
+    },
+  } as unknown as ChildProcess;
+
+  return { child, stdout, stderr, stdin };
+}
 
 describe("silent-background-tasks e2e", () => {
   it("problem: raw agy stderr emits STATE_WAITING_FOR_TASKS without stdout plan notifications", () => {
@@ -125,5 +164,180 @@ describe("silent-background-tasks e2e", () => {
     expect(planMsg.params.update.entries[0]?.status).toBe("in_progress");
     expect(planMsg.params.update.entries[1]?.content).toBe("Subagent: Verification Agent");
     expect(planMsg.params.update.entries[1]?.status).toBe("in_progress");
+  });
+
+  it("problem: deferring prompt response during background task execution causes client turn to hang indefinitely", async () => {
+    // Reproduction of v1.4.0 defect:
+    // In v1.4.0, when a background task or subagent was launched, silent-background-tasks
+    // intercepted the end_turn prompt response and dropped it to wait for STATE_FULLY_IDLE.
+    // Because agy_acp_server never emits STATE_FULLY_IDLE and promptSettlementTimeoutMs=0,
+    // the client stream never receives the prompt response and the turn hangs forever.
+    const { child } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    // Simulate v1.4.0 interceptor behavior that defers end_turn while waiting for tasks
+    let isWaitingForTasks = false;
+    const v140DeferredFix: AcpFix = {
+      name: "v140-deferred-fix",
+      onInbound(msg: AcpStreamMessage): AcpStreamMessage[] {
+        const u = (msg as { params?: { update?: { sessionUpdate?: string; name?: string } } })
+          ?.params?.update;
+        if (u?.sessionUpdate === SESSION_UPDATES.TOOL_CALL && u.name === "invoke_subagent") {
+          isWaitingForTasks = true;
+        }
+        if ("result" in msg && isWaitingForTasks) {
+          // Drops prompt response!
+          return [];
+        }
+        return [msg];
+      },
+    };
+
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([v140DeferredFix]),
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // 1. Client initiates prompt turn
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 101,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: { sessionId: "sess-v140-hang", prompt: [] },
+    } as unknown as AcpStreamMessage);
+
+    // 2. Upstream emits tool call for subagent
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "sess-v140-hang",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: "call-sub-1",
+            name: "invoke_subagent",
+          },
+        },
+      }),
+    );
+
+    // 3. Upstream finishes its turn with end_turn
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 101,
+        result: { stopReason: "end_turn" },
+      }),
+    );
+
+    // Wait a brief tick to allow any pipeline dispatching
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // REPRODUCE DEFECT: Client NEVER receives the prompt response (id: 101),
+    // causing the UI spinner to run indefinitely ("it never stops")
+    const receivedPromptResponse = forwarded.find(
+      (m) => "id" in m && m.id === 101 && "result" in m,
+    );
+    expect(receivedPromptResponse).toBeUndefined();
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
+  it("solution: wrapped connector forwards prompt response immediately to client while tracking background tasks in synthesized plan", async () => {
+    const { child } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    const fix = createBackgroundTasksFix();
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([fix]),
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // 1. Client initiates prompt turn
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 202,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: { sessionId: "sess-fix-complete", prompt: [] },
+    } as unknown as AcpStreamMessage);
+
+    // 2. Upstream emits tool call for subagent
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "sess-fix-complete",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: "call-sub-2",
+            name: "invoke_subagent",
+            rawInput: {
+              Subagents: [{ Role: "Worker Agent", TypeName: "research" }],
+            },
+          },
+        },
+      }),
+    );
+
+    // 3. Upstream finishes its turn with end_turn
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 202,
+        result: { stopReason: "end_turn" },
+      }),
+    );
+
+    // Wait a brief tick to allow any pipeline dispatching
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // VERIFY FIX: Prompt response (id: 202) is immediately delivered to the client, stopping the spinner!
+    const receivedPromptResponse = forwarded.find(
+      (m) => "id" in m && m.id === 202 && "result" in m,
+    ) as { result?: { stopReason?: string } } | undefined;
+    expect(receivedPromptResponse).toBeDefined();
+    expect(receivedPromptResponse?.result?.stopReason).toBe("end_turn");
+
+    // VERIFY PLAN: Synthesized plan update was emitted to track the active background subagent
+    const planUpdate = forwarded.find(
+      (m) =>
+        "params" in m &&
+        (m.params as { update?: { sessionUpdate?: string } })?.update?.sessionUpdate === "plan",
+    ) as
+      | { params: { update: { entries: Array<{ content: string; status: string }> } } }
+      | undefined;
+    expect(planUpdate).toBeDefined();
+    expect(planUpdate?.params.update.entries[0]?.content).toBe("Subagent: Worker Agent");
+    expect(planUpdate?.params.update.entries[0]?.status).toBe("in_progress");
+
+    await reader.cancel();
+    supervisor.close();
   });
 });

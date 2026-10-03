@@ -313,21 +313,20 @@ describe("backgroundTasksFix processInbound", () => {
       },
     });
 
-    // 3. Upstream agy_acp_server prematurely sends end_turn response for prompt 1
-    const prematurePromptResponse: AcpStreamMessage = {
+    // 3. Upstream agy_acp_server sends end_turn response for prompt 1
+    const promptResponse: AcpStreamMessage = {
       jsonrpc: "2.0",
       id: 1,
       result: { stopReason: "end_turn" },
     } as unknown as AcpStreamMessage;
 
-    // This inbound prompt response should be intercepted and deferred because we are waiting for tasks!
+    // Prompt response is returned immediately to avoid client spinner deadlock
     const inboundResult = (await fix.onInbound?.(
-      prematurePromptResponse,
+      promptResponse,
       dummyInboundContext,
     )) as AcpStreamMessage[];
 
-    // Expect prematurePromptResponse to be deferred (not returned immediately)
-    expect(inboundResult).toEqual([]);
+    expect(inboundResult).toEqual([promptResponse]);
 
     // 4. Upstream onTurnEnd must NOT mark entries completed while waiting for tasks
     const turnEndMsgs = (await fix.onTurnEnd?.(
@@ -342,25 +341,13 @@ describe("backgroundTasksFix processInbound", () => {
       mockStderrContext,
     );
 
-    // Expected: deferred prompt response and completed plan should now be released
+    // Expected: completed plan should now be released
     const planCompletedMsg = forwardedMessages.find((m) => {
       if (!("params" in m) || !m.params || typeof m.params !== "object") return false;
       const p = m.params as { update?: { sessionUpdate?: string; entries?: PlanEntry[] } };
       return p.update?.sessionUpdate === "plan" && p.update.entries?.[0]?.status === "completed";
     });
     expect(planCompletedMsg).toBeDefined();
-
-    const releasedEndTurn = forwardedMessages.find((m) => {
-      if (!("result" in m) || !m.result || typeof m.result !== "object") return false;
-      const r = m.result as { stopReason?: string };
-      return r.stopReason === "end_turn";
-    });
-    expect(releasedEndTurn).toBeDefined();
-    expect(releasedEndTurn).toMatchObject({
-      jsonrpc: "2.0",
-      id: 1,
-      result: { stopReason: "end_turn" },
-    });
   });
 
   it("preserves live stream integrity by never injecting duplicate message chunks or tool calls during task completion", async () => {
@@ -392,11 +379,14 @@ describe("backgroundTasksFix processInbound", () => {
       mockStderrContext,
     );
 
-    // 3. Defer premature end_turn
-    await fix.onInbound?.(
-      { jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } } as unknown as AcpStreamMessage,
-      dummyInboundContext,
-    );
+    // 3. Upstream sends end_turn
+    const endTurnMsg = {
+      jsonrpc: "2.0",
+      id: 1,
+      result: { stopReason: "end_turn" },
+    } as unknown as AcpStreamMessage;
+    const endTurnRes = await fix.onInbound?.(endTurnMsg, dummyInboundContext);
+    expect(endTurnRes).toEqual([endTurnMsg]);
 
     // 4. Background task finishes, Antigravity logs STATE_RUNNING
     fix.onStderrLine?.(
@@ -421,12 +411,6 @@ describe("backgroundTasksFix processInbound", () => {
       );
     });
     expect(syntheticChunks).toHaveLength(0);
-
-    // Verify deferred end_turn was released
-    const releasedEndTurn = forwardedMessages.find(
-      (m) => (m as { result?: { stopReason?: string } }).result?.stopReason === "end_turn",
-    );
-    expect(releasedEndTurn).toBeDefined();
   });
 
   it("terminates prompt turn and clears active subtasks immediately when client cancels during background task execution", async () => {
@@ -458,13 +442,7 @@ describe("backgroundTasksFix processInbound", () => {
       mockStderrContext,
     );
 
-    // 3. Upstream prematurely sends end_turn -> deferred
-    await fix.onInbound?.(
-      { jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } } as unknown as AcpStreamMessage,
-      dummyInboundContext,
-    );
-
-    // 4. Client sends session/cancel while task is running
+    // 3. Client sends session/cancel while task is running
     const cancelMsg: AcpStreamMessage = {
       jsonrpc: "2.0",
       method: "session/cancel",
@@ -472,8 +450,8 @@ describe("backgroundTasksFix processInbound", () => {
     } as unknown as AcpStreamMessage;
     fix.onOutbound?.(cancelMsg, dummyOutboundContext);
 
-    // 5. Upstream sends cancelled prompt response
-    // If upstream returns result stopReason: "cancelled", it must NOT be deferred!
+    // 4. Upstream sends cancelled prompt response
+    // If upstream returns result stopReason: "cancelled", it must be passed through directly
     const cancelResponse: AcpStreamMessage = {
       jsonrpc: "2.0",
       id: 1,
@@ -481,14 +459,14 @@ describe("backgroundTasksFix processInbound", () => {
     } as unknown as AcpStreamMessage;
 
     const inboundResult = await fix.onInbound?.(cancelResponse, dummyInboundContext);
-    expect(inboundResult).toEqual([cancelResponse]); // NOT deferred!
+    expect(inboundResult).toEqual([cancelResponse]);
 
-    // 6. Active checklist items should be marked completed
+    // 5. Active checklist items should be marked completed
     const entries = fix.tracker.getEntries(sessionId);
     expect(entries.every((e) => e.status === "completed")).toBe(true);
   });
 
-  it("holds turn open when subagent execution begins even before stderr telemetry arrives", async () => {
+  it("forwards prompt response immediately while keeping background subagents in_progress in plan", async () => {
     const fix = createBackgroundTasksFix();
     const sessionId = "sess_subagent_hold";
 
@@ -521,7 +499,7 @@ describe("backgroundTasksFix processInbound", () => {
     } as unknown as AcpStreamMessage;
     await fix.onInbound?.(toolMsg, dummyInboundContext);
 
-    // 3. Upstream immediately sends end_turn before stderr line arrives
+    // 3. Upstream sends end_turn
     const prematureEndTurn: AcpStreamMessage = {
       jsonrpc: "2.0",
       id: 1,
@@ -529,9 +507,10 @@ describe("backgroundTasksFix processInbound", () => {
     } as unknown as AcpStreamMessage;
 
     const res = await fix.onInbound?.(prematureEndTurn, dummyInboundContext);
-    // Must be deferred!
-    expect(res).toEqual([]);
+    // Must NOT be deferred to avoid locking client spinner indefinitely!
+    expect(res).toEqual([prematureEndTurn]);
     expect(fix.tracker.isWaitingForTasks(sessionId)).toBe(true);
+    expect(fix.tracker.getEntries(sessionId)[0]?.status).toBe("in_progress");
   });
 
   it("synthesizes descriptive plan entries for schedule tool calls", async () => {

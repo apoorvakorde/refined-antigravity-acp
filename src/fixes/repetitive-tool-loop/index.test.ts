@@ -71,6 +71,14 @@ describe("repetitive-tool-loop unit tests", () => {
       expect(sig1).toBe(sig2);
     });
 
+    it("normalizes sleep durations in run_command CommandLine to detect busy-wait loops", () => {
+      const sig1 = computeToolCallSignature("run_command", { CommandLine: "sleep 3" });
+      const sig2 = computeToolCallSignature("run_command", { CommandLine: "sleep 5" });
+      const sig3 = computeToolCallSignature("run_command", { CommandLine: "/bin/sleep 10" });
+      expect(sig1).toBe(sig2);
+      expect(sig2).toBe(sig3);
+    });
+
     it("computes different signatures when functional arguments differ", () => {
       const sig1 = computeToolCallSignature("view_file", {
         AbsolutePath: "/tmp/foo.txt",

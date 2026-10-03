@@ -76,6 +76,14 @@ export function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/_/g, "");
 }
 
+export function normalizeCommandLine(cmd: string): string {
+  const trimmed = cmd.trim();
+  if (/^(?:\/bin\/|\/usr\/bin\/)?sleep\s+\d+(?:\.\d+)?s?$/i.test(trimmed)) {
+    return "sleep <N>";
+  }
+  return trimmed;
+}
+
 export function canonicalizeValue(val: unknown): unknown {
   if (val === null || val === undefined) return null;
   if (typeof val !== "object") return val;
@@ -87,7 +95,12 @@ export function canonicalizeValue(val: unknown): unknown {
   const filteredEntries = entries.filter(([k]) => !IGNORED_METADATA_KEYS.has(normalizeKey(k)));
   filteredEntries.sort(([a], [b]) => normalizeKey(a).localeCompare(normalizeKey(b)));
   for (const [k, v] of filteredEntries) {
-    sortedObj[normalizeKey(k)] = canonicalizeValue(v);
+    const normalizedKey = normalizeKey(k);
+    let canonicalVal = canonicalizeValue(v);
+    if (normalizedKey === "commandline" && typeof canonicalVal === "string") {
+      canonicalVal = normalizeCommandLine(canonicalVal);
+    }
+    sortedObj[normalizedKey] = canonicalVal;
   }
   return sortedObj;
 }

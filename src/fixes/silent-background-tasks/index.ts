@@ -12,7 +12,6 @@
 import {
   ACP_METHODS,
   SESSION_UPDATES,
-  STOP_REASONS,
   isMethod,
   type AcpFix,
   type AcpStreamMessage,
@@ -335,7 +334,6 @@ interface SessionPlanTracker {
   seenToolCallIds: Set<string>;
   activeToolCalls: Map<string, string>;
   taskIds: Map<string, string>;
-  deferredPromptResponse: AcpStreamMessage | null;
   pendingPlan: PlanEntry[] | null;
 }
 
@@ -458,7 +456,6 @@ export class BackgroundTasksTracker {
         seenToolCallIds: new Set<string>(),
         activeToolCalls: new Map<string, string>(),
         taskIds: new Map<string, string>(),
-        deferredPromptResponse: null,
         pendingPlan: null,
       };
       this.sessions.set(sessionId, tracker);
@@ -497,12 +494,12 @@ export class BackgroundTasksTracker {
       this.promptIdToSessionId.set(promptId, sessionId);
     }
     const tracker = this.getOrCreate(sessionId);
-    tracker.entries = [];
-    tracker.trackedSubagents = [];
+    const activeEntries = tracker.entries.filter((e) => e.status !== "completed");
+    tracker.entries = activeEntries;
+    tracker.trackedSubagents = tracker.trackedSubagents.filter((s) => s.status !== "completed");
     tracker.recentText = "";
     tracker.hasEmittedWaitingPlan = false;
-    tracker.isWaiting = false;
-    tracker.deferredPromptResponse = null;
+    tracker.isWaiting = activeEntries.length > 0;
     tracker.pendingPlan = null;
     tracker.seenToolCallIds.clear();
     tracker.activeToolCalls.clear();
@@ -535,10 +532,6 @@ export class BackgroundTasksTracker {
 
   getToolCommand(sessionId: string, toolCallId: string): string | undefined {
     return this.sessions.get(sessionId)?.activeToolCalls.get(toolCallId);
-  }
-
-  deferPromptResponse(sessionId: string, response: AcpStreamMessage): void {
-    this.getOrCreate(sessionId).deferredPromptResponse = response;
   }
 
   recordSubagents(sessionId: string, subagents: SubagentInfo[], toolCallId?: string): PlanEntry[] {
@@ -592,6 +585,10 @@ export class BackgroundTasksTracker {
       }
     }
 
+    if (changed && !tracker.entries.some((e) => e.status !== "completed")) {
+      tracker.isWaiting = false;
+    }
+
     return changed ? tracker.entries : null;
   }
 
@@ -601,6 +598,10 @@ export class BackgroundTasksTracker {
     let changed = Boolean(this.updateFromManageTask(sessionId, text));
     if (registerLaunchedTasksFromText(tracker, text)) changed = true;
     if (updateSubagentsFromText(tracker, text)) changed = true;
+
+    if (changed && !tracker.entries.some((e) => e.status !== "completed")) {
+      tracker.isWaiting = false;
+    }
 
     return changed ? tracker.entries : null;
   }
@@ -620,6 +621,11 @@ export class BackgroundTasksTracker {
         changed = true;
       }
     }
+
+    if (changed && !tracker.entries.some((e) => e.status !== "completed")) {
+      tracker.isWaiting = false;
+    }
+
     return changed ? tracker.entries : null;
   }
 
@@ -689,15 +695,9 @@ export class BackgroundTasksTracker {
     return createPlanUpdateMessage(sessionId, tracker.entries);
   }
 
-  onIdle(sessionId: string, context?: StderrContext | undefined): AcpStreamMessage | null {
+  onIdle(sessionId: string, _context?: StderrContext | undefined): AcpStreamMessage | null {
     const tracker = this.sessions.get(sessionId);
     if (!tracker || tracker.entries.length === 0) {
-      if (tracker?.deferredPromptResponse && context) {
-        const deferred = tracker.deferredPromptResponse;
-        tracker.deferredPromptResponse = null;
-        tracker.isWaiting = false;
-        context.forwardInbound(deferred);
-      }
       return null;
     }
 
@@ -707,16 +707,7 @@ export class BackgroundTasksTracker {
       entry.status = "completed";
     }
 
-    const planMsg = createPlanUpdateMessage(sessionId, tracker.entries);
-    if (tracker.deferredPromptResponse && context) {
-      const deferred = tracker.deferredPromptResponse;
-      tracker.deferredPromptResponse = null;
-      context.forwardInbound(planMsg);
-      context.forwardInbound(deferred);
-      return null;
-    }
-
-    return planMsg;
+    return createPlanUpdateMessage(sessionId, tracker.entries);
   }
 
   onCancel(sessionId: string): {
@@ -727,21 +718,12 @@ export class BackgroundTasksTracker {
     if (!tracker) return { planMsg: null, cancelPromptMsg: null };
     tracker.isWaiting = false;
     tracker.pendingPlan = null;
-    let cancelPromptMsg: AcpStreamMessage | null = null;
-    if (tracker.deferredPromptResponse && "id" in tracker.deferredPromptResponse) {
-      cancelPromptMsg = {
-        jsonrpc: "2.0",
-        id: tracker.deferredPromptResponse.id,
-        result: { stopReason: STOP_REASONS.CANCELLED },
-      };
-      tracker.deferredPromptResponse = null;
-    }
     for (const entry of tracker.entries) {
       entry.status = "completed";
     }
     const planMsg =
       tracker.entries.length > 0 ? createPlanUpdateMessage(sessionId, tracker.entries) : null;
-    return { planMsg, cancelPromptMsg };
+    return { planMsg, cancelPromptMsg: null };
   }
 
   onTurnEnd(sessionId: string): AcpStreamMessage | null {
@@ -984,30 +966,6 @@ function extractToolCallUpdate(
   return { sessionId, update: u };
 }
 
-function extractResponseSessionId(
-  msg: AcpStreamMessage,
-  tracker: BackgroundTasksTracker,
-  context?: InboundContext | undefined,
-): string | undefined {
-  if (!("id" in msg) || msg.id === null || msg.id === undefined) return undefined;
-  return context?.session?.sessionId ?? tracker.getSessionForPromptId(msg.id);
-}
-
-function tryInterceptWaitingPromptResponse(
-  msg: AcpStreamMessage,
-  tracker: BackgroundTasksTracker,
-  context?: InboundContext | undefined,
-): boolean {
-  const result = (msg as { result?: { stopReason?: unknown } }).result;
-  if (result?.stopReason !== STOP_REASONS.END_TURN) return false;
-
-  const sessionId = extractResponseSessionId(msg, tracker, context);
-  if (!sessionId || !tracker.isWaitingForTasks(sessionId)) return false;
-
-  tracker.deferPromptResponse(sessionId, msg);
-  return true;
-}
-
 function handleToolCallState(
   sessionId: string,
   u: SessionUpdatePayload,
@@ -1139,10 +1097,6 @@ function processInbound(
   tracker: BackgroundTasksTracker,
   context?: InboundContext | undefined,
 ): AcpStreamMessage[] {
-  if (tryInterceptWaitingPromptResponse(msg, tracker, context)) {
-    return [];
-  }
-
   const extracted = extractToolCallUpdate(msg);
   if (extracted) {
     const plan = processInboundToolCall(extracted.sessionId, extracted.update, tracker);
