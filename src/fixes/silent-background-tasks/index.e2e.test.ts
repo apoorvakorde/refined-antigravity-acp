@@ -11,6 +11,7 @@ import {
 import { AcpPipeline } from "../../core/pipeline.js";
 import { ProcessSupervisor } from "../../core/supervisor.js";
 import { createBackgroundTasksFix } from "./index.js";
+import { createDefaultFixes } from "../index.js";
 
 function createMockChild(): {
   child: ChildProcess;
@@ -336,6 +337,178 @@ describe("silent-background-tasks e2e", () => {
     expect(planUpdate).toBeDefined();
     expect(planUpdate?.params.update.entries[0]?.content).toBe("Subagent: Worker Agent");
     expect(planUpdate?.params.update.entries[0]?.status).toBe("in_progress");
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
+  it("problem: upstream halts in STATE_WAITING_FOR_TASKS after streaming assistant question without emitting terminal prompt response, freezing client spinner indefinitely", async () => {
+    const { child } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    // Raw pipeline without hardening fixes
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([]),
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // 1. Client sends prompt
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 301,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: {
+        sessionId: "sess-waiting-turn-hang",
+        prompt: [{ type: "text", text: "Is there a way to make it faster?" }],
+      },
+    } as unknown as AcpStreamMessage);
+
+    // 2. Upstream streams assistant message ending with a question
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "sess-waiting-turn-hang",
+          update: {
+            sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+            content: {
+              type: "text",
+              text: "Ready to proceed? I will commit and push the working tree, then launch the 5 parallel subagents.",
+            },
+          },
+        },
+      }),
+    );
+
+    // 3. Upstream emits usage_update
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "sess-waiting-turn-hang",
+          update: {
+            sessionUpdate: SESSION_UPDATES.USAGE_UPDATE,
+            used: 1250,
+            size: 1000000,
+          },
+        },
+      }),
+    );
+
+    // 4. Upstream localharness remains in STATE_WAITING_FOR_TASKS on stderr
+    supervisor.handleStderrLine(
+      'RAW WS MSG: {"trajectoryStateUpdate":{"trajectoryId":"sess-waiting-turn-hang","state":"STATE_WAITING_FOR_TASKS"}}',
+    );
+
+    // 5. Upstream produces NO prompt response { id: 301, result: ... }!
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // In raw agy, prompt response is never received, freezing client spinner indefinitely
+    const receivedPromptResponse = forwarded.find(
+      (m) => "id" in m && m.id === 301 && "result" in m,
+    );
+    expect(receivedPromptResponse).toBeUndefined();
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
+  it("solution: wrapped connector synthesizes prompt settlement when upstream halts in STATE_WAITING_FOR_TASKS after streaming assistant question", async () => {
+    const { child } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline(createDefaultFixes()),
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // 1. Client sends prompt (e.g. "Is there a way to make it faster?")
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 301,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: {
+        sessionId: "sess-waiting-turn-hang",
+        prompt: [{ type: "text", text: "Is there a way to make it faster?" }],
+      },
+    } as unknown as AcpStreamMessage);
+
+    // 2. Upstream streams assistant message ending with a question
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "sess-waiting-turn-hang",
+          update: {
+            sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+            content: {
+              type: "text",
+              text: "Ready to proceed? I will commit and push the working tree, then launch the 5 parallel subagents.",
+            },
+          },
+        },
+      }),
+    );
+
+    // 3. Upstream emits usage_update
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "sess-waiting-turn-hang",
+          update: {
+            sessionUpdate: SESSION_UPDATES.USAGE_UPDATE,
+            used: 1250,
+            size: 1000000,
+          },
+        },
+      }),
+    );
+
+    // 4. Upstream localharness remains in STATE_WAITING_FOR_TASKS on stderr
+    supervisor.handleStderrLine(
+      'RAW WS MSG: {"trajectoryStateUpdate":{"trajectoryId":"sess-waiting-turn-hang","state":"STATE_WAITING_FOR_TASKS"}}',
+    );
+
+    // 5. Upstream produces NO prompt response { id: 301, result: ... }!
+    // Wait briefly for prompt settlement synthesis (50ms timer)
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Client MUST receive synthesized prompt response (id: 301) with end_turn so Paseo clears the spinner!
+    const receivedPromptResponse = forwarded.find(
+      (m) => "id" in m && m.id === 301 && "result" in m,
+    ) as { result?: { stopReason?: string } } | undefined;
+
+    expect(receivedPromptResponse).toBeDefined();
+    expect(receivedPromptResponse?.result?.stopReason).toBe("end_turn");
 
     await reader.cancel();
     supervisor.close();

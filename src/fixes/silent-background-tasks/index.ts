@@ -12,6 +12,8 @@
 import {
   ACP_METHODS,
   SESSION_UPDATES,
+  STOP_REASONS,
+  isJsonRpcResponse,
   isMethod,
   type AcpFix,
   type AcpStreamMessage,
@@ -54,6 +56,19 @@ export function createPlanUpdateMessage(sessionId: string, entries: PlanEntry[])
         sessionUpdate: SESSION_UPDATES.PLAN,
         entries,
       },
+    },
+  };
+}
+
+export function createPromptSettlementMessage(
+  promptId: string | number,
+  stopReason: string = STOP_REASONS.END_TURN,
+): AcpStreamMessage {
+  return {
+    jsonrpc: "2.0",
+    id: promptId,
+    result: {
+      stopReason,
     },
   };
 }
@@ -333,8 +348,12 @@ interface SessionPlanTracker {
   isWaiting: boolean;
   seenToolCallIds: Set<string>;
   activeToolCalls: Map<string, string>;
+  inFlightToolCallIds: Set<string>;
   taskIds: Map<string, string>;
   pendingPlan: PlanEntry[] | null;
+  activePromptId?: string | number | undefined;
+  hasAssistantMessage: boolean;
+  settlementTimer: NodeJS.Timeout | null;
 }
 
 const MAX_TRACKED_SESSIONS = 100;
@@ -439,6 +458,8 @@ function registerLaunchedTasksFromText(tracker: SessionPlanTracker, text: string
 export class BackgroundTasksTracker {
   private readonly sessions = new Map<string, SessionPlanTracker>();
   private readonly promptIdToSessionId = new Map<string | number, string>();
+  private readonly settledPromptIds = new Set<string | number>();
+  private forwardInbound?: ((msg: AcpStreamMessage) => void) | undefined;
 
   private getOrCreate(sessionId: string): SessionPlanTracker {
     let tracker = this.sessions.get(sessionId);
@@ -455,12 +476,20 @@ export class BackgroundTasksTracker {
         isWaiting: false,
         seenToolCallIds: new Set<string>(),
         activeToolCalls: new Map<string, string>(),
+        inFlightToolCallIds: new Set<string>(),
         taskIds: new Map<string, string>(),
         pendingPlan: null,
+        activePromptId: undefined,
+        hasAssistantMessage: false,
+        settlementTimer: null,
       };
       this.sessions.set(sessionId, tracker);
     }
     return tracker;
+  }
+
+  setForwardInbound(fn: (msg: AcpStreamMessage) => void): void {
+    this.forwardInbound = fn;
   }
 
   getEntries(sessionId: string): readonly PlanEntry[] {
@@ -494,6 +523,13 @@ export class BackgroundTasksTracker {
       this.promptIdToSessionId.set(promptId, sessionId);
     }
     const tracker = this.getOrCreate(sessionId);
+    if (tracker.settlementTimer) {
+      clearTimeout(tracker.settlementTimer);
+      tracker.settlementTimer = null;
+    }
+    tracker.activePromptId = promptId;
+    tracker.hasAssistantMessage = false;
+    tracker.inFlightToolCallIds.clear();
     const activeEntries = tracker.entries.filter((e) => e.status !== "completed");
     tracker.entries = activeEntries;
     tracker.trackedSubagents = tracker.trackedSubagents.filter((s) => s.status !== "completed");
@@ -532,6 +568,91 @@ export class BackgroundTasksTracker {
 
   getToolCommand(sessionId: string, toolCallId: string): string | undefined {
     return this.sessions.get(sessionId)?.activeToolCalls.get(toolCallId);
+  }
+
+  onAssistantChunk(sessionId: string): void {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker) return;
+    tracker.hasAssistantMessage = true;
+    if (tracker.settlementTimer) {
+      clearTimeout(tracker.settlementTimer);
+      tracker.settlementTimer = null;
+    }
+  }
+
+  onToolCallStart(sessionId: string, toolCallId?: string): void {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker) return;
+    if (toolCallId) {
+      tracker.inFlightToolCallIds.add(toolCallId);
+    }
+    if (tracker.settlementTimer) {
+      clearTimeout(tracker.settlementTimer);
+      tracker.settlementTimer = null;
+    }
+  }
+
+  onToolCallEnd(sessionId: string, toolCallId?: string): void {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker || !toolCallId) return;
+    tracker.inFlightToolCallIds.delete(toolCallId);
+  }
+
+  isPromptSettled(promptId: string | number): boolean {
+    return this.settledPromptIds.has(promptId);
+  }
+
+  clearPromptSettled(promptId: string | number): void {
+    this.settledPromptIds.delete(promptId);
+  }
+
+  clearSettlementTimer(sessionId: string): void {
+    const tracker = this.sessions.get(sessionId);
+    if (tracker?.settlementTimer) {
+      clearTimeout(tracker.settlementTimer);
+      tracker.settlementTimer = null;
+    }
+  }
+
+  clearActivePromptId(sessionId: string): void {
+    const tracker = this.sessions.get(sessionId);
+    if (tracker) {
+      tracker.activePromptId = undefined;
+    }
+  }
+
+  canSettlePrompt(sessionId: string): boolean {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker) return false;
+    if (tracker.activePromptId === undefined || tracker.activePromptId === null) return false;
+    if (this.settledPromptIds.has(tracker.activePromptId)) return false;
+    if (!tracker.hasAssistantMessage) return false;
+    if (tracker.inFlightToolCallIds.size > 0) return false;
+    return (
+      tracker.isWaiting ||
+      tracker.trackedSubagents.length > 0 ||
+      tracker.entries.some((e) => e.status !== "completed")
+    );
+  }
+
+  armSettlementTimer(sessionId: string, delayMs = 50): void {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker || tracker.settlementTimer) return;
+    tracker.settlementTimer = setTimeout(() => {
+      tracker.settlementTimer = null;
+      if (!this.canSettlePrompt(sessionId)) return;
+      const promptId = tracker.activePromptId;
+      if (promptId === undefined || promptId === null) return;
+      tracker.activePromptId = undefined;
+      this.settledPromptIds.add(promptId);
+      if (this.settledPromptIds.size > 200) {
+        const first = this.settledPromptIds.values().next().value;
+        if (first !== undefined) this.settledPromptIds.delete(first);
+      }
+      const settlementMsg = createPromptSettlementMessage(promptId);
+      this.forwardInbound?.(settlementMsg);
+    }, delayMs);
+    tracker.settlementTimer.unref?.();
   }
 
   recordSubagents(sessionId: string, subagents: SubagentInfo[], toolCallId?: string): PlanEntry[] {
@@ -667,6 +788,10 @@ export class BackgroundTasksTracker {
       }
     }
 
+    if (this.canSettlePrompt(sessionId)) {
+      this.armSettlementTimer(sessionId);
+    }
+
     tracker.hasEmittedWaitingPlan = true;
     return createPlanUpdateMessage(sessionId, tracker.entries);
   }
@@ -716,6 +841,8 @@ export class BackgroundTasksTracker {
   } {
     const tracker = this.sessions.get(sessionId);
     if (!tracker) return { planMsg: null, cancelPromptMsg: null };
+    this.clearSettlementTimer(sessionId);
+    this.clearActivePromptId(sessionId);
     tracker.isWaiting = false;
     tracker.pendingPlan = null;
     for (const entry of tracker.entries) {
@@ -728,7 +855,9 @@ export class BackgroundTasksTracker {
 
   onTurnEnd(sessionId: string): AcpStreamMessage | null {
     const tracker = this.sessions.get(sessionId);
-    if (!tracker || tracker.entries.length === 0 || tracker.isWaiting) {
+    if (!tracker) return null;
+    this.clearSettlementTimer(sessionId);
+    if (tracker.entries.length === 0 || tracker.isWaiting) {
       return null;
     }
 
@@ -747,8 +876,15 @@ export class BackgroundTasksTracker {
   }
 
   dispose(): void {
+    for (const tracker of this.sessions.values()) {
+      if (tracker.settlementTimer) {
+        clearTimeout(tracker.settlementTimer);
+        tracker.settlementTimer = null;
+      }
+    }
     this.sessions.clear();
     this.promptIdToSessionId.clear();
+    this.settledPromptIds.clear();
   }
 }
 
@@ -1092,18 +1228,86 @@ function processInboundSessionUpdate(
   return text ? tracker.updateFromText(sessionId, text) : null;
 }
 
+function handleInboundResponse(
+  msg: AcpStreamMessage,
+  tracker: BackgroundTasksTracker,
+): AcpStreamMessage[] | null {
+  if (!isJsonRpcResponse(msg)) return null;
+  const id = msg.id;
+  if (id === undefined || id === null) return [msg];
+
+  if (tracker.isPromptSettled(id)) {
+    tracker.clearPromptSettled(id);
+    return [];
+  }
+  const sessionId = tracker.getSessionForPromptId(id);
+  if (sessionId) {
+    tracker.clearSettlementTimer(sessionId);
+    tracker.clearActivePromptId(sessionId);
+  }
+  return [msg];
+}
+
+function handleAssistantStreamState(
+  sessionId: string,
+  msg: AcpStreamMessage,
+  tracker: BackgroundTasksTracker,
+): void {
+  if (!isMethod(msg, ACP_METHODS.SESSION_UPDATE)) return;
+  const u = (msg.params as SessionUpdateParams | undefined)?.update;
+  if (!u) return;
+
+  if (
+    u.sessionUpdate === SESSION_UPDATES.AGENT_MESSAGE_CHUNK ||
+    u.sessionUpdate === SESSION_UPDATES.AGENT_THOUGHT_CHUNK
+  ) {
+    tracker.onAssistantChunk(sessionId);
+  } else if (u.sessionUpdate === SESSION_UPDATES.USAGE_UPDATE) {
+    if (tracker.canSettlePrompt(sessionId)) {
+      tracker.armSettlementTimer(sessionId);
+    }
+  }
+}
+
+function handleToolCallStreamState(
+  extracted: { sessionId: string; update: SessionUpdatePayload },
+  tracker: BackgroundTasksTracker,
+): void {
+  const { sessionId, update } = extracted;
+  if (update.sessionUpdate === SESSION_UPDATES.TOOL_CALL) {
+    tracker.onToolCallStart(sessionId, update.toolCallId);
+    return;
+  }
+  if (update.sessionUpdate === SESSION_UPDATES.TOOL_CALL_UPDATE) {
+    const isDone = update.status === "completed" || update.status === "failed";
+    const text = getPayloadText(update);
+    const isBg = text ? isBackgroundTaskOutput(text) : false;
+    if (isDone || isBg) {
+      tracker.onToolCallEnd(sessionId, update.toolCallId);
+    }
+  }
+}
+
 function processInbound(
   msg: AcpStreamMessage,
   tracker: BackgroundTasksTracker,
   context?: InboundContext | undefined,
 ): AcpStreamMessage[] {
+  const responseResult = handleInboundResponse(msg, tracker);
+  if (responseResult) return responseResult;
+
+  const sessionId = extractSessionId(msg) ?? context?.session?.sessionId;
+  if (sessionId) {
+    handleAssistantStreamState(sessionId, msg, tracker);
+  }
+
   const extracted = extractToolCallUpdate(msg);
   if (extracted) {
+    handleToolCallStreamState(extracted, tracker);
     const plan = processInboundToolCall(extracted.sessionId, extracted.update, tracker);
     return plan ? [msg, createPlanUpdateMessage(extracted.sessionId, plan)] : [msg];
   }
 
-  const sessionId = extractSessionId(msg) ?? context?.session?.sessionId;
   if (sessionId) {
     const plan = processInboundSessionUpdate(msg, sessionId, tracker);
     if (plan) return [msg, createPlanUpdateMessage(sessionId, plan)];
@@ -1198,14 +1402,23 @@ export function createSilentBackgroundTasksFix(
     tracker,
 
     onOutbound(msg: AcpStreamMessage, context: OutboundContext): AcpStreamMessage {
+      if (context.forwardInbound) {
+        tracker.setForwardInbound(context.forwardInbound);
+      }
       return handleOutbound(msg, tracker, context);
     },
 
     onInbound(msg: AcpStreamMessage, context: InboundContext): AcpStreamMessage[] {
+      if (context.forwardInbound) {
+        tracker.setForwardInbound(context.forwardInbound);
+      }
       return processInbound(msg, tracker, context);
     },
 
     onStderrLine(line: string, context: StderrContext): boolean {
+      if (context.forwardInbound) {
+        tracker.setForwardInbound(context.forwardInbound);
+      }
       return processStderrLine(line, tracker, context);
     },
 

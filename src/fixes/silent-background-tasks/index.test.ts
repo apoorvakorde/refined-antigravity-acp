@@ -1104,3 +1104,87 @@ describe("Background task tracking via content blocks and assistant announcement
     });
   });
 });
+
+describe("prompt settlement during background tasks", () => {
+  it("synthesizes prompt end_turn response when upstream halts in STATE_WAITING_FOR_TASKS without prompt response", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "sess_settle_bg";
+    const forwarded: AcpStreamMessage[] = [];
+    const inboundContext: InboundContext = {
+      ...dummyInboundContext,
+      forwardInbound: (msg: AcpStreamMessage) => forwarded.push(msg),
+    };
+
+    // 1. Initial subagent was tracked in plan
+    fix.tracker.recordSubagents(sessionId, [{ role: "Worker", typeName: "research" }]);
+    fix.tracker.setWaiting(sessionId, true);
+
+    // 2. Client sends a subsequent prompt
+    fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 401,
+        method: "session/prompt",
+        params: { sessionId, prompt: [] },
+      } as unknown as AcpStreamMessage,
+      { ...inboundContext } as unknown as OutboundContext,
+    );
+
+    // 3. Assistant streams text
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "What would you like me to do next?" },
+          },
+        },
+      } as unknown as AcpStreamMessage,
+      inboundContext,
+    );
+
+    // 4. Upstream emits usage_update
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: 500,
+            size: 100000,
+          },
+        },
+      } as unknown as AcpStreamMessage,
+      inboundContext,
+    );
+
+    // Wait for settlement timer (50ms)
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(forwarded).toContainEqual({
+      jsonrpc: "2.0",
+      id: 401,
+      result: {
+        stopReason: "end_turn",
+      },
+    });
+
+    // 5. Late upstream response for prompt 401 should be dropped
+    const lateResponse = (await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 401,
+        result: { stopReason: "end_turn" },
+      } as unknown as AcpStreamMessage,
+      inboundContext,
+    )) as AcpStreamMessage[];
+
+    expect(lateResponse).toEqual([]);
+    fix.dispose?.();
+  });
+});
