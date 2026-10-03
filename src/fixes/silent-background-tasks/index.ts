@@ -23,7 +23,12 @@ import {
   type SessionUpdatePayload,
 } from "../../core/types.js";
 
-import { extractSessionId, setFixData } from "../../core/session-cache.js";
+import {
+  extractSessionId,
+  setFixData,
+  getSession,
+  getOrCreateSession,
+} from "../../core/session-cache.js";
 import { TELEMETRY_STATES, parseTrajectoryStateUpdate } from "../../core/telemetry.js";
 
 export const TOOL_INVOKE_SUBAGENT = "invoke_subagent";
@@ -331,6 +336,7 @@ interface SessionPlanTracker {
   activeToolCalls: Map<string, string>;
   taskIds: Map<string, string>;
   deferredPromptResponse: AcpStreamMessage | null;
+  pendingPlan: PlanEntry[] | null;
 }
 
 const MAX_TRACKED_SESSIONS = 100;
@@ -453,6 +459,7 @@ export class BackgroundTasksTracker {
         activeToolCalls: new Map<string, string>(),
         taskIds: new Map<string, string>(),
         deferredPromptResponse: null,
+        pendingPlan: null,
       };
       this.sessions.set(sessionId, tracker);
     }
@@ -467,8 +474,22 @@ export class BackgroundTasksTracker {
     const tracker = this.sessions.get(sessionId);
     if (!tracker) return false;
     return (
-      tracker.trackedSubagents.length > 0 || tracker.entries.some((e) => e.status !== "completed")
+      tracker.isWaiting ||
+      tracker.trackedSubagents.length > 0 ||
+      tracker.entries.some((e) => e.status !== "completed")
     );
+  }
+
+  setPendingPlan(sessionId: string, entries: PlanEntry[]): void {
+    this.getOrCreate(sessionId).pendingPlan = entries;
+  }
+
+  flushPendingPlan(sessionId: string): AcpStreamMessage | null {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker || !tracker.pendingPlan) return null;
+    const plan = tracker.pendingPlan;
+    tracker.pendingPlan = null;
+    return createPlanUpdateMessage(sessionId, plan);
   }
 
   onPromptStart(sessionId: string, promptId?: string | number | undefined): void {
@@ -482,6 +503,7 @@ export class BackgroundTasksTracker {
     tracker.hasEmittedWaitingPlan = false;
     tracker.isWaiting = false;
     tracker.deferredPromptResponse = null;
+    tracker.pendingPlan = null;
     tracker.seenToolCallIds.clear();
     tracker.activeToolCalls.clear();
     tracker.taskIds.clear();
@@ -704,6 +726,7 @@ export class BackgroundTasksTracker {
     const tracker = this.sessions.get(sessionId);
     if (!tracker) return { planMsg: null, cancelPromptMsg: null };
     tracker.isWaiting = false;
+    tracker.pendingPlan = null;
     let cancelPromptMsg: AcpStreamMessage | null = null;
     if (tracker.deferredPromptResponse && "id" in tracker.deferredPromptResponse) {
       cancelPromptMsg = {
@@ -1175,9 +1198,23 @@ function handleOutboundCancel(
   tracker: BackgroundTasksTracker,
   context: OutboundContext,
 ): void {
+  const hadActiveTasks = tracker.hasActiveTasksOrSubagents(sessionId);
   const { planMsg, cancelPromptMsg } = tracker.onCancel(sessionId);
   if (planMsg) context.forwardInbound?.(planMsg);
   if (cancelPromptMsg) forwardCancelPromptMsg(cancelPromptMsg, context);
+
+  const session =
+    context.session ??
+    (context.sessionCache ? getSession(context.sessionCache, sessionId) : undefined);
+  if (hadActiveTasks) {
+    const targetSession =
+      session ??
+      (context.sessionCache ? getOrCreateSession(context.sessionCache, sessionId) : undefined);
+    if (targetSession) {
+      targetSession.needsRecycle = true;
+      setFixData(targetSession, "hadActiveTasksOnCancel", true);
+    }
+  }
 }
 
 function handleOutbound(
@@ -1219,8 +1256,12 @@ export function createSilentBackgroundTasksFix(
     },
 
     onTurnEnd(sessionId: string, _context: InboundContext): AcpStreamMessage[] {
+      const pendingPlan = tracker.flushPendingPlan(sessionId);
       const planMsg = tracker.onTurnEnd(sessionId);
-      return planMsg ? [planMsg] : [];
+      const messages: AcpStreamMessage[] = [];
+      if (pendingPlan) messages.push(pendingPlan);
+      if (planMsg && (!pendingPlan || planMsg !== pendingPlan)) messages.push(planMsg);
+      return messages;
     },
 
     dispose(): void {
