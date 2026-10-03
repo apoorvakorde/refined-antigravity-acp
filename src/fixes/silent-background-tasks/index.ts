@@ -55,22 +55,57 @@ export function createPlanUpdateMessage(sessionId: string, entries: PlanEntry[])
 }
 
 export interface SubagentInfo {
+  id?: string | undefined;
   role?: string | undefined;
   prompt?: string | undefined;
   typeName?: string | undefined;
+  conversationId?: string | undefined;
+}
+
+export interface TrackedSubagentInfo extends SubagentInfo {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+}
+
+export interface SubagentStatusReport {
+  role?: string | undefined;
+  type?: string | undefined;
+  conversationId?: string | undefined;
+  state?: string | undefined;
+}
+
+export function isSubagentCompletedState(state?: string): boolean {
+  if (!state) return false;
+  const s = state.toLowerCase();
+  return s === "idle" || s === "completed" || s === "done" || s === "finished";
+}
+
+function getStringProp(obj: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const val = obj[key];
+    if (typeof val === "string") return val;
+  }
+  return undefined;
 }
 
 function parseSubagentItem(item: unknown): SubagentInfo | null {
   if (!item || typeof item !== "object") return null;
-  const s = item as { Role?: unknown; Prompt?: unknown; TypeName?: unknown };
+  const s = item as Record<string, unknown>;
+  const role = getStringProp(s, "Role", "role");
+  const prompt = getStringProp(s, "Prompt", "prompt");
+  const typeName = getStringProp(s, "TypeName", "typeName", "type");
+  const conversationId = getStringProp(s, "conversationId", "ConversationId");
+  const id = getStringProp(s, "id", "Id") ?? conversationId;
   return {
-    role: typeof s.Role === "string" ? s.Role : undefined,
-    prompt: typeof s.Prompt === "string" ? s.Prompt : undefined,
-    typeName: typeof s.TypeName === "string" ? s.TypeName : undefined,
+    id,
+    role,
+    prompt,
+    typeName,
+    conversationId,
   };
 }
 
-export function parseSubagentsFromArgs(rawArgs: unknown): SubagentInfo[] {
+function extractSubagentsArray(rawArgs: unknown): unknown[] {
   if (!rawArgs) return [];
   let obj: unknown = rawArgs;
   if (typeof rawArgs === "string") {
@@ -81,9 +116,137 @@ export function parseSubagentsFromArgs(rawArgs: unknown): SubagentInfo[] {
     }
   }
   if (!obj || typeof obj !== "object") return [];
-  const subs = (obj as { Subagents?: unknown }).Subagents;
-  if (!Array.isArray(subs)) return [];
+  const record = obj as Record<string, unknown>;
+  let subs = record.Subagents ?? record.subagents;
+  if (typeof subs === "string") {
+    try {
+      subs = JSON.parse(subs);
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(subs) ? subs : [];
+}
+
+export function parseSubagentsFromArgs(rawArgs: unknown): SubagentInfo[] {
+  const subs = extractSubagentsArray(rawArgs);
   return subs.map(parseSubagentItem).filter((s): s is SubagentInfo => s !== null);
+}
+
+export function parseSubagentStatusReports(rawOutput: unknown): SubagentStatusReport[] {
+  if (!rawOutput) return [];
+  let text = "";
+  if (typeof rawOutput === "string") {
+    text = rawOutput;
+  } else if (typeof rawOutput === "object") {
+    try {
+      text = JSON.stringify(rawOutput);
+    } catch {
+      return [];
+    }
+  }
+  const startIdx = text.indexOf("[");
+  const endIdx = text.lastIndexOf("]");
+  if (startIdx === -1 || endIdx <= startIdx) return [];
+
+  try {
+    const parsed = JSON.parse(text.slice(startIdx, endIdx + 1));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+      .map(mapSubagentReport);
+  } catch {
+    return [];
+  }
+}
+
+function mapSubagentReport(item: Record<string, unknown>): SubagentStatusReport {
+  return {
+    role:
+      typeof item.role === "string"
+        ? item.role
+        : typeof item.Role === "string"
+          ? item.Role
+          : undefined,
+    type:
+      typeof item.type === "string"
+        ? item.type
+        : typeof item.TypeName === "string"
+          ? item.TypeName
+          : undefined,
+    conversationId:
+      typeof item.conversationId === "string"
+        ? item.conversationId
+        : typeof item.ConversationId === "string"
+          ? item.ConversationId
+          : undefined,
+    state:
+      typeof item.state === "string"
+        ? item.state
+        : typeof item.State === "string"
+          ? item.State
+          : undefined,
+  };
+}
+
+function isCompletionPhrasePresent(lowerText: string): boolean {
+  return (
+    lowerText.includes("complete") ||
+    lowerText.includes("finished") ||
+    lowerText.includes("idle") ||
+    lowerText.includes("success") ||
+    lowerText.includes("passed") ||
+    lowerText.includes("verified")
+  );
+}
+
+function matchSubagentByRoleOrPrompt(sub: TrackedSubagentInfo, lowerText: string): boolean {
+  if (sub.role && sub.role.trim().length > 3) {
+    const roleLower = sub.role.toLowerCase().trim();
+    if (lowerText.includes(roleLower) && isCompletionPhrasePresent(lowerText)) {
+      return true;
+    }
+  }
+
+  if (sub.prompt) {
+    const itemMatch = sub.prompt.match(/\bItem\s+(\d+)\b/i);
+    if (itemMatch?.[1]) {
+      const itemNum = itemMatch[1];
+      const pattern1 = new RegExp(
+        `\\bItem\\s+${itemNum}\\b[^.\\n]*\\b(complete|completed|finished|success|verified)\\b`,
+        "i",
+      );
+      const pattern2 = new RegExp(`\\b(completed|finished|verified)\\s+Item\\s+${itemNum}\\b`, "i");
+      return pattern1.test(lowerText) || pattern2.test(lowerText);
+    }
+  }
+
+  return false;
+}
+
+export function detectCompletedSubagentsInText(
+  text: string,
+  trackedSubagents: TrackedSubagentInfo[],
+): TrackedSubagentInfo[] {
+  const completed: TrackedSubagentInfo[] = [];
+  const lower = text.toLowerCase();
+
+  for (const sub of trackedSubagents) {
+    if (sub.status === "completed") continue;
+
+    if (sub.conversationId && text.includes(sub.conversationId)) {
+      if (isCompletionPhrasePresent(lower)) {
+        completed.push(sub);
+        continue;
+      }
+    }
+
+    if (matchSubagentByRoleOrPrompt(sub, lower)) {
+      completed.push(sub);
+    }
+  }
+
+  return completed;
 }
 
 export function formatSubagentContent(info: SubagentInfo): string {
@@ -101,8 +264,35 @@ export function formatSubagentContent(info: SubagentInfo): string {
   return "Subagent: Background Task";
 }
 
+export function reconstructPlanFromSteps(steps: readonly unknown[]): PlanEntry[] {
+  const entries: PlanEntry[] = [];
+  const seenContent = new Set<string>();
+
+  for (const step of steps) {
+    const s = step as { kind?: string; name?: string; rawInputJson?: string };
+    if (s.kind === "tool_call" && s.name === TOOL_INVOKE_SUBAGENT && s.rawInputJson) {
+      const subs = parseSubagentsFromArgs(s.rawInputJson);
+      for (const sub of subs) {
+        const content = formatSubagentContent(sub);
+        if (!seenContent.has(content)) {
+          seenContent.add(content);
+          entries.push({
+            content,
+            priority: "high",
+            status: "completed",
+          });
+        }
+      }
+    }
+  }
+
+  return entries;
+}
+
 interface SessionPlanTracker {
   entries: PlanEntry[];
+  trackedSubagents: TrackedSubagentInfo[];
+  recentText: string;
   hasEmittedWaitingPlan: boolean;
   isWaiting: boolean;
   seenToolCallIds: Set<string>;
@@ -111,6 +301,54 @@ interface SessionPlanTracker {
 }
 
 const MAX_TRACKED_SESSIONS = 100;
+
+function applyReportToExistingSubagent(
+  report: SubagentStatusReport,
+  matched: TrackedSubagentInfo,
+  tracker: SessionPlanTracker,
+): boolean {
+  if (report.conversationId && !matched.conversationId) {
+    matched.conversationId = report.conversationId;
+  }
+  if (isSubagentCompletedState(report.state) && matched.status !== "completed") {
+    matched.status = "completed";
+    const entry = tracker.entries.find((e) => e.content === matched.content);
+    if (entry) entry.status = "completed";
+    return true;
+  }
+  return false;
+}
+
+function applyReportToTracker(report: SubagentStatusReport, tracker: SessionPlanTracker): boolean {
+  const isDone = isSubagentCompletedState(report.state);
+  const matched = tracker.trackedSubagents.find(
+    (s) =>
+      (report.conversationId && s.conversationId === report.conversationId) ||
+      (report.role && s.role && s.role.trim().toLowerCase() === report.role.trim().toLowerCase()),
+  );
+
+  if (matched) {
+    return applyReportToExistingSubagent(report, matched, tracker);
+  }
+
+  const subInfo: SubagentInfo = {
+    role: report.role,
+    typeName: report.type,
+    conversationId: report.conversationId,
+  };
+  const content = formatSubagentContent(subInfo);
+  const status = isDone ? "completed" : "in_progress";
+  tracker.trackedSubagents.push({ ...subInfo, content, status });
+  tracker.entries.push({ content, priority: "high", status });
+  return true;
+}
+
+function isTaskMatchingEntry(entry: PlanEntry, taskId?: string, totalEntries = 0): boolean {
+  if (entry.status === "completed" || !entry.content.startsWith("Background task:")) {
+    return false;
+  }
+  return !taskId || entry.content.includes(taskId) || totalEntries === 1;
+}
 
 export class BackgroundTasksTracker {
   private readonly sessions = new Map<string, SessionPlanTracker>();
@@ -125,6 +363,8 @@ export class BackgroundTasksTracker {
       }
       tracker = {
         entries: [],
+        trackedSubagents: [],
+        recentText: "",
         hasEmittedWaitingPlan: false,
         isWaiting: false,
         seenToolCallIds: new Set<string>(),
@@ -140,12 +380,22 @@ export class BackgroundTasksTracker {
     return this.sessions.get(sessionId)?.entries ?? [];
   }
 
+  hasActiveTasksOrSubagents(sessionId: string): boolean {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker) return false;
+    return (
+      tracker.trackedSubagents.length > 0 || tracker.entries.some((e) => e.status !== "completed")
+    );
+  }
+
   onPromptStart(sessionId: string, promptId?: string | number | undefined): void {
     if (promptId !== undefined) {
       this.promptIdToSessionId.set(promptId, sessionId);
     }
     const tracker = this.getOrCreate(sessionId);
     tracker.entries = [];
+    tracker.trackedSubagents = [];
+    tracker.recentText = "";
     tracker.hasEmittedWaitingPlan = false;
     tracker.isWaiting = false;
     tracker.deferredPromptResponse = null;
@@ -186,13 +436,91 @@ export class BackgroundTasksTracker {
     if (toolCallId) {
       tracker.seenToolCallIds.add(toolCallId);
     }
-    const newEntries: PlanEntry[] = subagents.map((s) => ({
-      content: formatSubagentContent(s),
-      priority: "high",
-      status: "in_progress",
-    }));
-    tracker.entries.push(...newEntries);
+
+    for (const s of subagents) {
+      const content = formatSubagentContent(s);
+      const existing = tracker.trackedSubagents.find(
+        (t) =>
+          t.content === content ||
+          (s.role && t.role && t.role.trim().toLowerCase() === s.role.trim().toLowerCase()),
+      );
+      if (existing) {
+        if (s.conversationId && !existing.conversationId) {
+          existing.conversationId = s.conversationId;
+        }
+        continue;
+      }
+
+      tracker.trackedSubagents.push({
+        ...s,
+        content,
+        status: "in_progress",
+      });
+      tracker.entries.push({
+        content,
+        priority: "high",
+        status: "in_progress",
+      });
+    }
+
     return tracker.entries;
+  }
+
+  updateFromManageSubagents(sessionId: string, rawOutput: unknown): PlanEntry[] | null {
+    const reports = parseSubagentStatusReports(rawOutput);
+    if (reports.length === 0) return null;
+    const tracker = this.getOrCreate(sessionId);
+    let changed = false;
+
+    for (const report of reports) {
+      if (applyReportToTracker(report, tracker)) {
+        changed = true;
+      }
+    }
+
+    return changed ? tracker.entries : null;
+  }
+
+  updateFromText(sessionId: string, text: string): PlanEntry[] | null {
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker || tracker.entries.length === 0) return null;
+
+    tracker.recentText = `${tracker.recentText} ${text}`.slice(-3000);
+    const completed = detectCompletedSubagentsInText(tracker.recentText, tracker.trackedSubagents);
+    if (completed.length === 0) return null;
+
+    let changed = false;
+    for (const sub of completed) {
+      if (sub.status !== "completed") {
+        sub.status = "completed";
+        const entry = tracker.entries.find((e) => e.content === sub.content);
+        if (entry) entry.status = "completed";
+        changed = true;
+      }
+    }
+
+    return changed ? tracker.entries : null;
+  }
+
+  updateFromManageTask(sessionId: string, rawOutput: unknown): PlanEntry[] | null {
+    if (typeof rawOutput !== "string") return null;
+    if (!rawOutput.includes("finished with result:") && !rawOutput.includes("exited with code")) {
+      return null;
+    }
+    const tracker = this.sessions.get(sessionId);
+    if (!tracker) return null;
+
+    const match = rawOutput.match(/Task id ["']?([^"'\s]+)["']?\s+finished/i);
+    const taskId = match?.[1];
+
+    let changed = false;
+    for (const entry of tracker.entries) {
+      if (isTaskMatchingEntry(entry, taskId, tracker.entries.length)) {
+        entry.status = "completed";
+        changed = true;
+      }
+    }
+    return changed ? tracker.entries : null;
   }
 
   recordCustomTask(
@@ -227,7 +555,9 @@ export class BackgroundTasksTracker {
       });
     } else {
       for (const entry of tracker.entries) {
-        entry.status = "in_progress";
+        if (entry.status !== "completed") {
+          entry.status = "in_progress";
+        }
       }
     }
 
@@ -248,6 +578,10 @@ export class BackgroundTasksTracker {
 
     tracker.isWaiting = false;
     tracker.hasEmittedWaitingPlan = false;
+    if (tracker.trackedSubagents.length > 0) {
+      return null;
+    }
+
     for (const entry of tracker.entries) {
       entry.status = "completed";
     }
@@ -491,7 +825,13 @@ function handleInboundToolCall(
     return entries.length > prevCount ? entries : null;
   }
   if (toolName === TOOL_SCHEDULE) {
+    if (tracker.hasActiveTasksOrSubagents(sessionId)) {
+      return null;
+    }
     const taskName = formatScheduleTask(toolArgs);
+    if (taskName === "Timer" || taskName.startsWith("Timer: Wait")) {
+      return null;
+    }
     const prevCount = tracker.getEntries(sessionId).length;
     const entries = tracker.recordCustomTask(sessionId, taskName, "medium", toolCallId);
     tracker.setWaiting(sessionId, true);
@@ -569,6 +909,83 @@ function handleToolCallState(
   return null;
 }
 
+function extractDeltaText(delta: unknown): string | null {
+  if (typeof delta === "string") return delta;
+  if (delta && typeof delta === "object") {
+    const text = (delta as { text?: unknown }).text;
+    if (typeof text === "string") return text;
+  }
+  return null;
+}
+
+function extractContentText(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (content && typeof content === "object") {
+    const text = (content as { text?: unknown }).text;
+    if (typeof text === "string") return text;
+  }
+  return null;
+}
+
+function extractUpdateText(msg: AcpStreamMessage): string | null {
+  if (!("params" in msg) || !msg.params) return null;
+  const p = (msg.params as SessionUpdateParams | undefined)?.update;
+  if (!p) return null;
+  return (
+    extractContentText(p.content) ??
+    extractDeltaText((p as { delta?: unknown }).delta) ??
+    (typeof p.rawOutput === "string" ? p.rawOutput : null)
+  );
+}
+
+function processToolCallUpdate(
+  sessionId: string,
+  u: SessionUpdatePayload,
+  tracker: BackgroundTasksTracker,
+): PlanEntry[] | null {
+  if (u.sessionUpdate !== SESSION_UPDATES.TOOL_CALL_UPDATE || !u.rawOutput) {
+    return null;
+  }
+  const subEntries = tracker.updateFromManageSubagents(sessionId, u.rawOutput);
+  if (subEntries) return subEntries;
+
+  const taskEntries = tracker.updateFromManageTask(sessionId, u.rawOutput);
+  if (taskEntries) return taskEntries;
+
+  if (typeof u.rawOutput === "string") {
+    return tracker.updateFromText(sessionId, u.rawOutput);
+  }
+  return null;
+}
+
+function processInboundToolCall(
+  sessionId: string,
+  u: SessionUpdatePayload,
+  tracker: BackgroundTasksTracker,
+): PlanEntry[] | null {
+  const updatedPlan = processToolCallUpdate(sessionId, u, tracker);
+  if (updatedPlan) return updatedPlan;
+
+  const bgEntries = handleToolCallState(sessionId, u, tracker);
+  if (bgEntries) return bgEntries;
+
+  const toolArgs = u.rawInput ?? u.arguments;
+  const toolName = inferToolName(u.name ?? undefined, u.title ?? undefined, toolArgs);
+  if (!toolName) return null;
+
+  return handleInboundToolCall(sessionId, toolName, toolArgs, tracker, u.toolCallId);
+}
+
+function processInboundSessionUpdate(
+  msg: AcpStreamMessage,
+  sessionId: string,
+  tracker: BackgroundTasksTracker,
+): PlanEntry[] | null {
+  if (!isMethod(msg, ACP_METHODS.SESSION_UPDATE)) return null;
+  const text = extractUpdateText(msg);
+  return text ? tracker.updateFromText(sessionId, text) : null;
+}
+
 function processInbound(
   msg: AcpStreamMessage,
   tracker: BackgroundTasksTracker,
@@ -579,20 +996,18 @@ function processInbound(
   }
 
   const extracted = extractToolCallUpdate(msg);
-  if (!extracted) return [msg];
-
-  const { sessionId, update: u } = extracted;
-  const bgEntries = handleToolCallState(sessionId, u, tracker);
-  if (bgEntries) {
-    return [msg, createPlanUpdateMessage(sessionId, bgEntries)];
+  if (extracted) {
+    const plan = processInboundToolCall(extracted.sessionId, extracted.update, tracker);
+    return plan ? [msg, createPlanUpdateMessage(extracted.sessionId, plan)] : [msg];
   }
 
-  const toolArgs = u.rawInput ?? u.arguments;
-  const toolName = inferToolName(u.name ?? undefined, u.title ?? undefined, toolArgs);
-  if (!toolName) return [msg];
+  const sessionId = extractSessionId(msg) ?? context?.session?.sessionId;
+  if (sessionId) {
+    const plan = processInboundSessionUpdate(msg, sessionId, tracker);
+    if (plan) return [msg, createPlanUpdateMessage(sessionId, plan)];
+  }
 
-  const entries = handleInboundToolCall(sessionId, toolName, toolArgs, tracker, u.toolCallId);
-  return entries ? [msg, createPlanUpdateMessage(sessionId, entries)] : [msg];
+  return [msg];
 }
 
 function processStderrLine(
