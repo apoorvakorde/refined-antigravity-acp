@@ -264,26 +264,58 @@ export function formatSubagentContent(info: SubagentInfo): string {
   return "Subagent: Background Task";
 }
 
+export interface BackgroundTaskInfo {
+  desc: string;
+  taskId?: string | undefined;
+}
+
+export function detectLaunchedTasksInText(text: string): BackgroundTaskInfo[] {
+  const launched: BackgroundTaskInfo[] = [];
+  const p1 =
+    /(?:launched|running|started)\s+`([^`]+)`\s+in\s+the\s+background(?:\s*\(task\s+`?([^`)\s]+)`?\))?/gi;
+  for (const m of text.matchAll(p1)) {
+    if (m[1]) {
+      let taskId = m[2]?.trim();
+      if (taskId && taskId.includes("/")) {
+        taskId = taskId.split("/").pop();
+      }
+      launched.push({ desc: m[1].trim(), taskId });
+    }
+  }
+  return launched;
+}
+
+function appendReconstructedTask(content: string, seen: Set<string>, entries: PlanEntry[]): void {
+  if (!seen.has(content)) {
+    seen.add(content);
+    entries.push({ content, priority: "high", status: "completed" });
+  }
+}
+
+function processStepForReconstruction(
+  step: unknown,
+  seen: Set<string>,
+  entries: PlanEntry[],
+): void {
+  const s = step as { kind?: string; name?: string; rawInputJson?: string; text?: string };
+  if (s.kind === "tool_call" && s.name === TOOL_INVOKE_SUBAGENT && s.rawInputJson) {
+    for (const sub of parseSubagentsFromArgs(s.rawInputJson)) {
+      appendReconstructedTask(formatSubagentContent(sub), seen, entries);
+    }
+  }
+  if (s.kind === "assistant" && s.text) {
+    for (const t of detectLaunchedTasksInText(s.text)) {
+      appendReconstructedTask(`Background task: ${t.desc}`, seen, entries);
+    }
+  }
+}
+
 export function reconstructPlanFromSteps(steps: readonly unknown[]): PlanEntry[] {
   const entries: PlanEntry[] = [];
   const seenContent = new Set<string>();
 
   for (const step of steps) {
-    const s = step as { kind?: string; name?: string; rawInputJson?: string };
-    if (s.kind === "tool_call" && s.name === TOOL_INVOKE_SUBAGENT && s.rawInputJson) {
-      const subs = parseSubagentsFromArgs(s.rawInputJson);
-      for (const sub of subs) {
-        const content = formatSubagentContent(sub);
-        if (!seenContent.has(content)) {
-          seenContent.add(content);
-          entries.push({
-            content,
-            priority: "high",
-            status: "completed",
-          });
-        }
-      }
-    }
+    processStepForReconstruction(step, seenContent, entries);
   }
 
   return entries;
@@ -297,6 +329,7 @@ interface SessionPlanTracker {
   isWaiting: boolean;
   seenToolCallIds: Set<string>;
   activeToolCalls: Map<string, string>;
+  taskIds: Map<string, string>;
   deferredPromptResponse: AcpStreamMessage | null;
 }
 
@@ -343,11 +376,60 @@ function applyReportToTracker(report: SubagentStatusReport, tracker: SessionPlan
   return true;
 }
 
-function isTaskMatchingEntry(entry: PlanEntry, taskId?: string, totalEntries = 0): boolean {
+function isTaskMatchingEntry(
+  entry: PlanEntry,
+  taskId?: string,
+  totalEntries = 0,
+  taskIds?: Map<string, string>,
+): boolean {
   if (entry.status === "completed" || !entry.content.startsWith("Background task:")) {
     return false;
   }
-  return !taskId || entry.content.includes(taskId) || totalEntries === 1;
+  if (!taskId) return true;
+  if (entry.content.includes(taskId)) return true;
+  if (taskIds?.get(taskId) === entry.content) return true;
+  return totalEntries === 1;
+}
+
+function extractFinishedTaskId(rawOutput: string): string | undefined {
+  if (!rawOutput.includes("finished with result:") && !rawOutput.includes("exited with code")) {
+    return undefined;
+  }
+  const match = rawOutput.match(/Task id ["']?([^"'\s]+)["']?\s+finished/i);
+  let taskId = match?.[1];
+  if (taskId && taskId.includes("/")) {
+    taskId = taskId.split("/").pop();
+  }
+  return taskId;
+}
+
+function updateSubagentsFromText(tracker: SessionPlanTracker, text: string): boolean {
+  if (tracker.trackedSubagents.length === 0) return false;
+  tracker.recentText = `${tracker.recentText} ${text}`.slice(-3000);
+  const completed = detectCompletedSubagentsInText(tracker.recentText, tracker.trackedSubagents);
+  let changed = false;
+  for (const sub of completed) {
+    if (sub.status !== "completed") {
+      sub.status = "completed";
+      const entry = tracker.entries.find((e) => e.content === sub.content);
+      if (entry) entry.status = "completed";
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function registerLaunchedTasksFromText(tracker: SessionPlanTracker, text: string): boolean {
+  let changed = false;
+  for (const t of detectLaunchedTasksInText(text)) {
+    const content = `Background task: ${t.desc}`;
+    if (!tracker.entries.some((e) => e.content === content)) {
+      tracker.entries.push({ content, priority: "high", status: "in_progress" });
+      if (t.taskId) tracker.taskIds.set(t.taskId, content);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 export class BackgroundTasksTracker {
@@ -369,6 +451,7 @@ export class BackgroundTasksTracker {
         isWaiting: false,
         seenToolCallIds: new Set<string>(),
         activeToolCalls: new Map<string, string>(),
+        taskIds: new Map<string, string>(),
         deferredPromptResponse: null,
       };
       this.sessions.set(sessionId, tracker);
@@ -401,6 +484,15 @@ export class BackgroundTasksTracker {
     tracker.deferredPromptResponse = null;
     tracker.seenToolCallIds.clear();
     tracker.activeToolCalls.clear();
+    tracker.taskIds.clear();
+  }
+
+  recordTaskId(sessionId: string, taskId: string, content: string): void {
+    let id = taskId;
+    if (id.includes("/")) {
+      id = id.split("/").pop() ?? id;
+    }
+    this.getOrCreate(sessionId).taskIds.set(id, content);
   }
 
   getSessionForPromptId(promptId: string | number): string | undefined {
@@ -482,40 +574,26 @@ export class BackgroundTasksTracker {
   }
 
   updateFromText(sessionId: string, text: string): PlanEntry[] | null {
-    const tracker = this.sessions.get(sessionId);
-    if (!tracker || tracker.entries.length === 0) return null;
+    const tracker = this.getOrCreate(sessionId);
 
-    tracker.recentText = `${tracker.recentText} ${text}`.slice(-3000);
-    const completed = detectCompletedSubagentsInText(tracker.recentText, tracker.trackedSubagents);
-    if (completed.length === 0) return null;
-
-    let changed = false;
-    for (const sub of completed) {
-      if (sub.status !== "completed") {
-        sub.status = "completed";
-        const entry = tracker.entries.find((e) => e.content === sub.content);
-        if (entry) entry.status = "completed";
-        changed = true;
-      }
-    }
+    let changed = Boolean(this.updateFromManageTask(sessionId, text));
+    if (registerLaunchedTasksFromText(tracker, text)) changed = true;
+    if (updateSubagentsFromText(tracker, text)) changed = true;
 
     return changed ? tracker.entries : null;
   }
 
   updateFromManageTask(sessionId: string, rawOutput: unknown): PlanEntry[] | null {
     if (typeof rawOutput !== "string") return null;
-    if (!rawOutput.includes("finished with result:") && !rawOutput.includes("exited with code")) {
+    const taskId = extractFinishedTaskId(rawOutput);
+    if (taskId === undefined && !rawOutput.includes("finished with result:")) {
       return null;
     }
-    const tracker = this.sessions.get(sessionId);
-    if (!tracker) return null;
-
-    const match = rawOutput.match(/Task id ["']?([^"'\s]+)["']?\s+finished/i);
-    const taskId = match?.[1];
+    const tracker = this.getOrCreate(sessionId);
 
     let changed = false;
     for (const entry of tracker.entries) {
-      if (isTaskMatchingEntry(entry, taskId, tracker.entries.length)) {
+      if (isTaskMatchingEntry(entry, taskId, tracker.entries.length, tracker.taskIds)) {
         entry.status = "completed";
         changed = true;
       }
@@ -790,24 +868,52 @@ function extractCommandLine(rawArgs: unknown): string | null {
   return null;
 }
 
-function extractBackgroundTaskDescription(
-  rawOutput: unknown,
-  _toolCallId?: string | undefined,
-  storedCommand?: string | undefined,
-): string | null {
-  if (typeof rawOutput !== "string") return null;
-  if (
-    !rawOutput.includes("Tool is running as a background task") &&
-    !rawOutput.includes("task id:")
-  ) {
-    return null;
-  }
-  const match = rawOutput.match(/Task Description:\s*([^\n\r]+)/i);
+function extractTaskDescFromText(text: string, storedCommand?: string): string {
+  const match = text.match(/Task Description:\s*([^\n\r]+)/i);
   let desc = match?.[1]?.trim() || storedCommand || "command";
   if (desc.startsWith('"') && desc.endsWith('"')) {
     desc = desc.slice(1, -1);
   }
   return desc;
+}
+
+function extractTaskIdFromText(text: string): string | undefined {
+  const idMatch = text.match(/task id:\s*([^\s\n\r]+)/i);
+  let taskId = idMatch?.[1]?.trim();
+  if (taskId && taskId.includes("/")) {
+    taskId = taskId.split("/").pop();
+  }
+  return taskId;
+}
+
+function isBackgroundTaskOutput(text: string): boolean {
+  return (
+    text.includes("Tool is running as a background task") ||
+    text.includes("is running as a background task") ||
+    text.includes("task id:")
+  );
+}
+
+export function extractBackgroundTaskInfo(
+  rawOutput: unknown,
+  _toolCallId?: string | undefined,
+  storedCommand?: string | undefined,
+): BackgroundTaskInfo | null {
+  const text = typeof rawOutput === "string" ? rawOutput : extractContentText(rawOutput);
+  if (!text || !isBackgroundTaskOutput(text)) return null;
+
+  return {
+    desc: extractTaskDescFromText(text, storedCommand),
+    taskId: extractTaskIdFromText(text),
+  };
+}
+
+export function extractBackgroundTaskDescription(
+  rawOutput: unknown,
+  toolCallId?: string | undefined,
+  storedCommand?: string | undefined,
+): string | null {
+  return extractBackgroundTaskInfo(rawOutput, toolCallId, storedCommand)?.desc ?? null;
 }
 
 function handleInboundToolCall(
@@ -893,15 +999,15 @@ function handleToolCallState(
   }
 
   if (u.sessionUpdate === SESSION_UPDATES.TOOL_CALL_UPDATE) {
+    const text = getPayloadText(u);
     const storedCmd = u.toolCallId ? tracker.getToolCommand(sessionId, u.toolCallId) : undefined;
-    const bgDesc = extractBackgroundTaskDescription(u.rawOutput, u.toolCallId, storedCmd);
-    if (bgDesc) {
-      const entries = tracker.recordCustomTask(
-        sessionId,
-        `Background task: ${bgDesc}`,
-        "high",
-        u.toolCallId,
-      );
+    const bgInfo = extractBackgroundTaskInfo(text, u.toolCallId, storedCmd);
+    if (bgInfo) {
+      const content = `Background task: ${bgInfo.desc}`;
+      const entries = tracker.recordCustomTask(sessionId, content, "high", u.toolCallId);
+      if (bgInfo.taskId) {
+        tracker.recordTaskId(sessionId, bgInfo.taskId, content);
+      }
       tracker.setWaiting(sessionId, true);
       return entries;
     }
@@ -918,13 +1024,32 @@ function extractDeltaText(delta: unknown): string | null {
   return null;
 }
 
-function extractContentText(content: unknown): string | null {
-  if (typeof content === "string") return content;
-  if (content && typeof content === "object") {
-    const text = (content as { text?: unknown }).text;
-    if (typeof text === "string") return text;
+function extractItemText(item: unknown): string | null {
+  if (typeof item === "string") return item;
+  if (item && typeof item === "object") {
+    const t = (item as { text?: unknown }).text;
+    if (typeof t === "string") return t;
   }
   return null;
+}
+
+function extractContentText(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = content.map(extractItemText).filter((t): t is string => Boolean(t));
+    return parts.length > 0 ? parts.join("\n") : null;
+  }
+  return extractItemText(content);
+}
+
+function getPayloadText(u: SessionUpdatePayload): string | null {
+  if (typeof u.rawOutput === "string") return u.rawOutput;
+  if (u.rawOutput && typeof u.rawOutput === "object") {
+    try {
+      return JSON.stringify(u.rawOutput);
+    } catch {}
+  }
+  return extractContentText(u.content);
 }
 
 function extractUpdateText(msg: AcpStreamMessage): string | null {
@@ -943,19 +1068,19 @@ function processToolCallUpdate(
   u: SessionUpdatePayload,
   tracker: BackgroundTasksTracker,
 ): PlanEntry[] | null {
-  if (u.sessionUpdate !== SESSION_UPDATES.TOOL_CALL_UPDATE || !u.rawOutput) {
+  if (u.sessionUpdate !== SESSION_UPDATES.TOOL_CALL_UPDATE) {
     return null;
   }
-  const subEntries = tracker.updateFromManageSubagents(sessionId, u.rawOutput);
+  const text = getPayloadText(u);
+  if (!text) return null;
+
+  const subEntries = tracker.updateFromManageSubagents(sessionId, text);
   if (subEntries) return subEntries;
 
-  const taskEntries = tracker.updateFromManageTask(sessionId, u.rawOutput);
+  const taskEntries = tracker.updateFromManageTask(sessionId, text);
   if (taskEntries) return taskEntries;
 
-  if (typeof u.rawOutput === "string") {
-    return tracker.updateFromText(sessionId, u.rawOutput);
-  }
-  return null;
+  return tracker.updateFromText(sessionId, text);
 }
 
 function processInboundToolCall(
@@ -963,11 +1088,11 @@ function processInboundToolCall(
   u: SessionUpdatePayload,
   tracker: BackgroundTasksTracker,
 ): PlanEntry[] | null {
-  const updatedPlan = processToolCallUpdate(sessionId, u, tracker);
-  if (updatedPlan) return updatedPlan;
-
   const bgEntries = handleToolCallState(sessionId, u, tracker);
   if (bgEntries) return bgEntries;
+
+  const updatedPlan = processToolCallUpdate(sessionId, u, tracker);
+  if (updatedPlan) return updatedPlan;
 
   const toolArgs = u.rawInput ?? u.arguments;
   const toolName = inferToolName(u.name ?? undefined, u.title ?? undefined, toolArgs);

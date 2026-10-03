@@ -960,6 +960,10 @@ describe("reconstructPlanFromSteps", () => {
         name: "run_command",
         rawInputJson: JSON.stringify({ CommandLine: "git status" }),
       },
+      {
+        kind: "assistant",
+        text: "I have launched `mise run check` in the background (task `task-2216`) to verify all repo quality gates.",
+      },
     ];
 
     const plan = reconstructPlanFromSteps(steps);
@@ -970,6 +974,154 @@ describe("reconstructPlanFromSteps", () => {
         priority: "high",
         status: "completed",
       },
+      {
+        content: "Background task: mise run check",
+        priority: "high",
+        status: "completed",
+      },
     ]);
+  });
+});
+
+describe("Background task tracking via content blocks and assistant announcements", () => {
+  it("detects background task from standard ACP content array in tool_call_update", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "sess_content_bg";
+
+    const toolCallMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cmd_1",
+          name: "run_command",
+          rawInput: {
+            CommandLine: "mise run check",
+            toolSummary: "Mise run check",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+    await fix.onInbound?.(toolCallMsg, dummyInboundContext);
+
+    const bgUpdateMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_cmd_1",
+          status: "completed",
+          content: [
+            {
+              type: "text",
+              text: "Created At: 2026-10-03T13:14:42+02:00\nTool is running as a background task with task id: sess_content_bg/task-2216\nTask Description: mise run check\nTask logs are available at: ...",
+            },
+          ],
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(bgUpdateMsg, dummyInboundContext)) as AcpStreamMessage[];
+    expect(res).toHaveLength(2);
+    expect(res[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Background task: mise run check",
+              priority: "high",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    });
+
+    // When task finishes with result, match by taskId and mark completed
+    const completionMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: 'Task id "sess_content_bg/task-2216" finished with result:\nThe command exited with code 0.',
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const compRes = (await fix.onInbound?.(
+      completionMsg,
+      dummyInboundContext,
+    )) as AcpStreamMessage[];
+    expect(compRes).toHaveLength(2);
+    expect(compRes[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Background task: mise run check",
+              priority: "high",
+              status: "completed",
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("detects launched background task from assistant streaming announcement", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "sess_announce_bg";
+
+    const announceMsg: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: "I have launched `mise run check` in the background (task `task-2216`) to verify all repo quality gates.",
+          },
+        },
+      },
+    } as unknown as AcpStreamMessage;
+
+    const res = (await fix.onInbound?.(announceMsg, dummyInboundContext)) as AcpStreamMessage[];
+    expect(res).toHaveLength(2);
+    expect(res[1]).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            {
+              content: "Background task: mise run check",
+              priority: "high",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    });
   });
 });
